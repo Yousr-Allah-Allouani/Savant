@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Xcode build outputs / user-specific files
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+
+# Swift Package Manager
+.build/
+Packages/
+Package.pins
+Package.resolved
+*.xcworkspace/xcuserdata/
+
+# CocoaPods / Carthage (not used today but future-proof)
+Pods/
+Carthage/Build/
+
+# Misc
+*.swp
+*.log
