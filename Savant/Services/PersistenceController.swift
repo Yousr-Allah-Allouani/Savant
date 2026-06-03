@@ -344,10 +344,42 @@ struct NoteService {
         return note
     }
 
+    @discardableResult
+    func createNote(title: String, in space: Space) throws -> Note {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = Note(
+            title: trimmed.isEmpty ? "Untitled" : String(trimmed.prefix(72)),
+            bodyMarkdown: "",
+            tier: .random,
+            space: space
+        )
+        context.insert(note)
+        try context.save()
+        return note
+    }
+
     func save(note: Note, title: String, body: String) throws {
         let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         note.title = normalizedTitle.isEmpty ? NoteService.title(from: body) : normalizedTitle
         note.bodyMarkdown = body
+        note.titleRichTextRTF = nil
+        note.bodyRichTextRTF = nil
+        note.updatedAt = Date()
+        try context.save()
+    }
+
+    func saveRichText(
+        note: Note,
+        title: String,
+        titleRTFData: Data? = nil,
+        body: String,
+        rtfData: Data?
+    ) throws {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        note.title = normalizedTitle.isEmpty ? NoteService.title(from: body) : normalizedTitle
+        note.bodyMarkdown = body
+        note.titleRichTextRTF = titleRTFData
+        note.bodyRichTextRTF = rtfData
         note.updatedAt = Date()
         try context.save()
     }
@@ -397,6 +429,7 @@ struct NoteService {
         let copy = Note(
             title: "\(note.title) copy",
             bodyMarkdown: note.bodyMarkdown,
+            bodyRichTextRTF: note.bodyRichTextRTF,
             tier: note.tier,
             space: note.space,
             folder: note.folder

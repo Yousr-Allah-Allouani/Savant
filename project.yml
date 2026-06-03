@@ -25,10 +25,18 @@ targets:
           - Resources/Info.plist
           - Resources/Assets.xcassets
           - Savant.entitlements
+          - SavantMac.entitlements
+          - Views/Mac
     resources:
       - path: Savant/Resources
     entitlements:
       path: Savant/Savant.entitlements
+      properties:
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.app.savant
+        com.apple.developer.icloud-services:
+          - CloudKit
+        aps-environment: development
     dependencies:
       - package: RichEditorSwiftUI
     settings:
@@ -71,10 +79,21 @@ targets:
       - path: Savant/Models
       - path: Savant/AI
       - path: Savant/Services/PersistenceController.swift
+      - path: Savant/Services/FolderService.swift
       - path: Savant/Extensions/Color+Scheme.swift
+      - path: Savant/Extensions/View+HoverTracking.swift
       - path: Savant/Views/Mac
     resources:
       - path: Savant/Resources/Assets.xcassets
+    entitlements:
+      path: Savant/SavantMac.entitlements
+      properties:
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.app.savant
+        com.apple.developer.icloud-services:
+          - CloudKit
+        aps-environment: development
+        com.apple.security.network.client: true
     dependencies:
       - package: RichEditorSwiftUI
     settings:

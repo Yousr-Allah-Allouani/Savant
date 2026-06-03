@@ -87,38 +87,5 @@ struct FolderRowView: View {
     }
 }
 
-@MainActor
-struct FolderService {
-    let context: ModelContext
-
-    func delete(_ folder: Folder) throws {
-        let folderID = folder.id
-        let descriptor = FetchDescriptor<Note>(predicate: #Predicate { $0.folder?.id == folderID })
-        let notes = try context.fetch(descriptor)
-        for note in notes {
-            note.folder = nil
-        }
-        context.delete(folder)
-        try context.save()
-    }
-
-    func moveNote(_ note: Note, into folder: Folder) throws {
-        note.folder = folder
-        if let space = folder.space {
-            note.space = space
-        }
-        note.tier = folder.tier
-        note.updatedAt = Date()
-        try context.save()
-    }
-
-    func changeTier(_ folder: Folder, to tier: NoteTier) throws {
-        let folderID = folder.id
-        folder.tier = tier
-        let descriptor = FetchDescriptor<Note>(predicate: #Predicate { $0.folder?.id == folderID })
-        for note in try context.fetch(descriptor) {
-            note.tier = tier
-        }
-        try context.save()
-    }
-}
+// `FolderService` lives in `Services/FolderService.swift` so it compiles into
+// both the iOS and macOS targets.

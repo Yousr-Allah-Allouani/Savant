@@ -67,6 +67,10 @@ final class Space {
     var sortIndex: Int = 0
     var createdAt: Date = Date()
     var isPreset: Bool = false
+    /// Optional Zen-style gradient config (encoded `ZenGradientConfig`).
+    /// When present, the macOS shell renders this instead of the flat
+    /// `colorHex/darkColorHex` pair. iOS falls back to the flat colors.
+    var gradientConfigJSON: Data? = nil
 
     @Relationship(deleteRule: .cascade, inverse: \SpaceProfile.space) var profile: SpaceProfile?
     @Relationship(deleteRule: .cascade, inverse: \Note.space) var notes: [Note]? = []
@@ -129,7 +133,9 @@ final class SpaceProfile {
 final class Note {
     var id: UUID = UUID()
     var title: String = ""
+    var titleRichTextRTF: Data?
     var bodyMarkdown: String = ""
+    var bodyRichTextRTF: Data?
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
     var tier: NoteTier = NoteTier.random
@@ -145,7 +151,9 @@ final class Note {
     init(
         id: UUID = UUID(),
         title: String,
+        titleRichTextRTF: Data? = nil,
         bodyMarkdown: String,
+        bodyRichTextRTF: Data? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         tier: NoteTier,
@@ -155,7 +163,9 @@ final class Note {
     ) {
         self.id = id
         self.title = title
+        self.titleRichTextRTF = titleRichTextRTF
         self.bodyMarkdown = bodyMarkdown
+        self.bodyRichTextRTF = bodyRichTextRTF
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.tier = tier
@@ -173,11 +183,33 @@ final class Folder {
     var createdByTidy: Bool = false
     var sortIndex: Int = 0
     var tier: NoteTier = NoteTier.random
+    /// Persisted disclosure state. Default expanded (collapsed == false) so
+    /// freshly created folders reveal their contents.
+    var isCollapsed: Bool = false
     var space: Space?
     var parent: Folder?
 
     @Relationship(deleteRule: .cascade, inverse: \Folder.parent) var children: [Folder]? = []
     @Relationship(deleteRule: .nullify, inverse: \Note.folder) var notes: [Note]? = []
+
+    /// Maximum nesting depth for user-created folders. Top-level folders are
+    /// depth 0, so this allows three visible tiers (0/1/2). Matches Zen's
+    /// bounded-nesting default (SPEC §20.7); Random tidy-folders stay flat.
+    static let maxDepth = 2
+
+    /// Depth in the folder tree, computed by walking the `parent` chain.
+    /// Top-level == 0. Guarded against cycles by a hop cap.
+    var depth: Int {
+        var d = 0
+        var node = parent
+        var hops = 0
+        while let current = node, hops <= Folder.maxDepth + 2 {
+            d += 1
+            node = current.parent
+            hops += 1
+        }
+        return d
+    }
 
     init(
         id: UUID = UUID(),
@@ -187,7 +219,8 @@ final class Folder {
         parent: Folder? = nil,
         sortIndex: Int,
         space: Space? = nil,
-        tier: NoteTier
+        tier: NoteTier,
+        isCollapsed: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -197,6 +230,7 @@ final class Folder {
         self.sortIndex = sortIndex
         self.space = space
         self.tier = tier
+        self.isCollapsed = isCollapsed
     }
 }
 
@@ -205,7 +239,7 @@ final class Attachment {
     var id: UUID = UUID()
     var kind: AttachmentKind = AttachmentKind.link
     var url: URL?
-    var imageData: Data?
+    @Attribute(.externalStorage) var imageData: Data?
     var voiceTranscript: String?
     var linkTitle: String?
     var linkSiteName: String?

@@ -7,12 +7,15 @@ struct SavantApp: App {
 
     private let modelContainer: ModelContainer = {
         let isUITesting = ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        // CloudKit syncs the iCloud.app.savant private database across the iOS and
+        // macOS targets (both declare that container in their entitlements).
+        // Enabled on device; kept off in the simulator (no reliable silent push,
+        // flaky iCloud account state) and during UI tests.
+        let cloudKitEnabled = !isUITesting && !Self.isSimulator
         do {
-            // CloudKit disabled until entitlements + container are configured in the developer portal.
-            // Flip back to `!isUITesting && !Self.isSimulator` once iCloud.app.savant exists.
             return try PersistenceController.makeModelContainer(
                 inMemory: isUITesting,
-                cloudKitEnabled: false
+                cloudKitEnabled: cloudKitEnabled
             )
         } catch {
             fatalError("Unable to create SwiftData container: \(error)")

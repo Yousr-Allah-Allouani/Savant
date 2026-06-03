@@ -61,6 +61,61 @@ extension Color {
             opacity: Double(a.alphaComponent * (1 - t) + b.alphaComponent * t)
         )
     }
+
+    /// WCAG relative luminance in [0, 1]. Used to choose readable ink over an
+    /// arbitrary space-color fill (pale pastels vs dark-mode tones).
+    var relativeLuminance: Double {
+        guard let c = NSColor(self).usingColorSpace(.sRGB) else { return 0.5 }
+        func lin(_ v: CGFloat) -> Double {
+            let v = Double(v)
+            return v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * lin(c.redComponent)
+            + 0.7152 * lin(c.greenComponent)
+            + 0.0722 * lin(c.blueComponent)
+    }
+
+    /// Readable text/glyph color for content drawn on a selected pill filled
+    /// with `self`. Compares the WCAG contrast ratio of near-black vs white
+    /// against the fill and returns whichever reads better — so the selected
+    /// row stays legible on a cream theme *and* a dark navy theme. Near-black
+    /// (rather than pure black) softens the result on light fills.
+    var selectionInk: Color {
+        let lum = relativeLuminance
+        let contrastWhite = 1.05 / (lum + 0.05)
+        let contrastBlack = (lum + 0.05) / 0.05
+        return contrastBlack >= contrastWhite ? Color.black.opacity(0.85) : .white
+    }
+
+    /// Elevated, space-tinted fill for a *selected* row/tile pill (Arc-style
+    /// lift). It sits LIGHTER than the space-tinted sidebar background so the
+    /// pill reads as a raised card rather than melting into the surface, while
+    /// keeping a hint of the space hue so selection stays themed. Pair with
+    /// `.selectionInk` (computed on the returned color) for readable text and
+    /// a soft shadow for depth.
+    /// Adjusts the color's saturation/brightness multiplicatively (HSB). Used to
+    /// derive a deeper, more vibrant version of a pastel space color.
+    func adjusted(saturation sFactor: CGFloat, brightness bFactor: CGFloat) -> Color {
+        guard let c = NSColor(self).usingColorSpace(.sRGB) else { return self }
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Color(hue: Double(h),
+                     saturation: Double(min(1, max(0, s * sFactor))),
+                     brightness: Double(min(1, max(0, b * bFactor))),
+                     opacity: Double(a))
+    }
+
+    func elevatedSelectionFill(scheme: ColorScheme) -> Color {
+        switch scheme {
+        case .dark:
+            // Lift the dark space tone toward a raised dark-card surface —
+            // a little lighter than the background, not stark white.
+            return mixed(with: Color(white: 0.95), by: 0.26)
+        default:
+            // Near-white wash that keeps a faint space tint (~20%).
+            return mixed(with: .white, by: 0.80)
+        }
+    }
     #endif
 }
 

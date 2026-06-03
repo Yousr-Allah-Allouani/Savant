@@ -1,7 +1,84 @@
 import SwiftData
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
 
 #if os(macOS)
+
+/// Per-space multi-selection set for batch operations (⌘-click to toggle,
+/// ⇧-click to range-select). Distinct from the single "open" note that fills
+/// the editor (`selectedNoteIDsBySpace`): this drives the batch context menu
+/// and shared row highlight. When empty, the open note carries the highlight.
+@Observable
+@MainActor
+final class NoteSelectionModel {
+    private(set) var selected: Set<UUID> = []
+    /// Anchor for ⇧-range selection — the last row the user ⌘/plain-clicked.
+    @ObservationIgnored private var anchorID: UUID?
+    /// The active space's currently-open note (shown in the editor). Kept in
+    /// sync by the sidebar. The open note is treated as implicitly selected, so
+    /// the first ⌘/⇧-click seeds it into the set rather than replacing it.
+    @ObservationIgnored var openNoteID: UUID?
+
+    var count: Int { selected.count }
+    var isActive: Bool { !selected.isEmpty }
+    func contains(_ id: UUID) -> Bool { selected.contains(id) }
+
+    func clear() {
+        guard !selected.isEmpty else { return }
+        selected = []
+        anchorID = nil
+    }
+
+    /// Before the first modified click grows a selection, fold in the open note
+    /// so it stays selected alongside the newly-clicked one.
+    private func seedFromOpenNoteIfEmpty() {
+        guard selected.isEmpty, let open = openNoteID else { return }
+        selected.insert(open)
+        if anchorID == nil { anchorID = open }
+    }
+
+    /// ⌘-click: toggle one row's membership, leaving the rest of the set intact.
+    func toggle(_ id: UUID) {
+        seedFromOpenNoteIfEmpty()
+        if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
+        anchorID = id
+    }
+
+    /// ⇧-click: select the contiguous run between the anchor and `id` within
+    /// `ordered` (the tier's displayed order). Falls back to a single select if
+    /// the anchor isn't resolvable (e.g. anchor lives in another tier).
+    func selectRange(to id: UUID, in ordered: [UUID]) {
+        seedFromOpenNoteIfEmpty()
+        guard let anchor = anchorID ?? selected.first,
+              let a = ordered.firstIndex(of: anchor),
+              let b = ordered.firstIndex(of: id) else {
+            selected = [id]
+            anchorID = id
+            return
+        }
+        selected = Set(ordered[min(a, b)...max(a, b)])
+        // Keep the original anchor so successive ⇧-clicks pivot from it.
+        anchorID = anchor
+    }
+
+    /// Note the anchor on a plain open so a subsequent ⇧-click ranges from here.
+    func setAnchor(_ id: UUID) { anchorID = id }
+}
+
+/// Batch operations available from the multi-select context menu.
+enum NoteBatchAction {
+    case pin, makeEssential, moveToNotes, duplicate, archive, delete, openSplit
+}
+
+/// Which edge of the editor a note is being dragged toward → the split layout.
+enum SplitDropSide {
+    case left, right, top, bottom
+    var axis: Axis { (self == .left || self == .right) ? .horizontal : .vertical }
+    /// True when the dragged (secondary) note lands before the primary.
+    var secondaryLeading: Bool { self == .left || self == .top }
+}
 
 /// One value that captures everything affecting the vertical layout of
 /// the Essentials area at the top of the sidebar. Used as the `value:`
@@ -20,18 +97,76 @@ struct MacNotesSidebar: View {
     @Binding var selectedSpaceID: UUID?
     @Binding var selectedNoteIDsBySpace: [UUID: UUID]
     let spacePageOffset: CGFloat // fractional page index, animated by the parent
+    /// While creation mode is up, the form's gradient drives the
+    /// window+sidebar background. MacRootView owns the storage so the
+    /// entire window updates in real time.
+    @Binding var previewGradient: ZenGradientConfig?
+    let searchResetToken: Int
     let width: CGFloat
     let selectNote: (Note, Space) -> Void
     let createNote: () -> Void
+    /// Open the ⌘T command palette (the sidebar's New Note row routes here:
+    /// type a title + Enter to create, or run any command).
+    let openCommandPalette: () -> Void
+    /// True while the ⌘T palette is open — the New Note row then shows the
+    /// selected-bar treatment (Arc highlights the "New Tab" button while its
+    /// command bar is up).
+    let isCommandPaletteActive: Bool
     let createSpace: () -> Void
     let toggleSidebar: () -> Void
+    /// Ask the root to delete a space (routes through its confirm dialog).
+    let requestDeleteSpace: (Space) -> Void
+    /// Open the full-window Manage Spaces board.
+    let openManageSpaces: () -> Void
+    /// Open a note beside the current one (editor split).
+    let openInSplit: (Note) -> Void
+    /// Add an empty note beside the open one (the open tab's "Add to Split").
+    let addToSplit: (Note) -> Void
+    /// Release a dragged note over the editor → split the open note with it.
+    let onSplitDrop: (Note, SplitDropSide) -> Void
+    /// Persisted transient split pairs. The selected pair renders in the
+    /// editor; every pair remains combined in the sidebar until separated.
+    let activeSplits: [EditorSplit]
+    /// The open note awaiting its split partner (pick-mode) — its sidebar pill
+    /// renders a combined tab with an empty second slot.
+    var pendingSplitPrimaryID: UUID?
+    /// Dissolve the split, keeping BOTH notes as individual tabs.
+    let dissolveSplit: (UUID, NoteTier, Space) -> Void
+    /// Cancel a pending add-to-split.
+    var cancelPendingSplit: () -> Void = { }
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.modelContext) private var modelContext
     @State private var searchText: String = ""
-    @State private var session = CrossTierDragSession()
-    @State private var isDragging: Bool = false
-    @State private var dragTarget: NoteDropTarget?
+    // Hoisted to MacRootView so the editor pane can observe the in-progress
+    // drag (for the drag-onto-editor split).
+    let session: CrossTierDragSession
+    /// Multi-select set for batch actions (⌘/⇧-click). See NoteSelectionModel.
+    @State private var selection = NoteSelectionModel()
+    /// Notes queued for a batch delete; drives the destructive confirm dialog.
+    @State private var pendingBatchDelete: [Note] = []
+    /// Edge auto-switch: while dragging a note near the sidebar's left/right
+    /// edge, switch to the adjacent space after a short hold so the note can be
+    /// dropped there.
+    @State private var edgeSwitchTimer: Timer?
+    @State private var edgeSwitchTargetID: UUID?   // chip-drop target (one-shot)
+    @State private var edgeSwitchDir: Int = 0      // edge direction (repeating)
+    /// The folder currently showing its inline-rename text field (nil = none).
+    /// Set when a folder is created or "Rename" is chosen; threaded down to
+    /// `MacFolderRow`.
+    @State private var renamingFolderID: UUID?
+    // The docked sidebar is followed by the 3pt resizer and the workspace
+    // card's 6pt inset. Let pages travel through that gutter while swiping so
+    // they disappear exactly under the visible note-page edge.
+    private let pageClipTrailingBleed: CGFloat = 9
+    // Zen-style "Create Space" mode. While active, the upper sidebar
+    // content fades to 0 and the inline form takes over; the bottom rail
+    // stays put with its `+` morphed to an `X`. Mirrors
+    // ZenSpaceCreation.mjs's lifecycle: animate-out siblings, mount form,
+    // animate-in form (staggered), then reverse on cancel/create.
+    @State private var isCreatingSpace: Bool = false
+    @State private var cancelCreationTick: Int = 0
 
     private var selectedSpace: Space? {
         if let selectedSpaceID, let match = spaces.first(where: { $0.id == selectedSpaceID }) {
@@ -40,23 +175,91 @@ struct MacNotesSidebar: View {
         return spaces.first
     }
 
+    /// Create a top-level folder in the active space and drop straight into
+    /// inline rename. New user folders default to the Pinned tier (SPEC §20.7
+    /// — Random folders are tidy-only).
+    private func createFolder() {
+        guard let space = selectedSpace else { return }
+        if let folder = try? FolderService(context: modelContext).create(in: space, tier: .pinned, parent: nil) {
+            renamingFolderID = folder.id
+        }
+    }
+
     private var spaceColor: Color {
         guard let s = selectedSpace else { return .accentColor }
         return Color.spaceColor(lightHex: s.colorHex, darkHex: s.darkColorHex, scheme: colorScheme)
     }
 
+    /// The active space's currently-open (editor) note. Fed into the selection
+    /// model so a multi-select started from a single open note keeps it.
+    private var activeOpenNoteID: UUID? {
+        selectedSpace.flatMap { selectedNoteIDsBySpace[$0.id] }
+    }
+
+    /// Note id to render as *selected* in the list. While the ⌘T palette is
+    /// open the New Note row becomes the active selection, so the normal
+    /// open-note highlight is suppressed (Arc deselects the current tab while
+    /// its command bar is up). Per-space so each column resolves its own.
+    private func displayedSelectedNoteID(for space: Space?) -> UUID? {
+        guard !isCommandPaletteActive else { return nil }
+        return space.flatMap { selectedNoteIDsBySpace[$0.id] }
+    }
+
+    /// Plain click on a row: open it in the editor and drop any multi-select.
+    private func openNote(_ note: Note, in space: Space) {
+        selection.clear()
+        selection.setAnchor(note.id)
+        selectNote(note, space)
+    }
+
+    /// Run a batch action over the current multi-selection. Destructive
+    /// deletes route through a confirm dialog; everything else applies and
+    /// then clears the set. Order is preserved by applying in displayed order.
+    private func performBatch(_ action: NoteBatchAction) {
+        let targets = notes.filter { selection.contains($0.id) }
+            .sorted(by: noteSort)
+        guard !targets.isEmpty, let space = selectedSpace else { return }
+
+        if action == .delete {
+            pendingBatchDelete = targets
+            return
+        }
+
+        if action == .openSplit {
+            // Split the two selected notes: focus the first, add the second.
+            guard targets.count == 2 else { return }
+            selectNote(targets[0], space)
+            openInSplit(targets[1])
+            selection.clear()
+            return
+        }
+
+        let service = NoteService(context: modelContext)
+        for note in targets {
+            switch action {
+            case .pin: try? service.promote(note, to: .pinned, currentSpace: space)
+            case .makeEssential: try? service.promote(note, to: .favorite, currentSpace: space)
+            case .moveToNotes: try? service.promote(note, to: .random, currentSpace: space)
+            case .archive: try? service.archive(note)
+            case .duplicate: _ = try? service.duplicate(note)
+            case .delete, .openSplit: break
+            }
+        }
+        selection.clear()
+    }
+
+    private func commitBatchDelete() {
+        let service = NoteService(context: modelContext)
+        for note in pendingBatchDelete { try? service.delete(note) }
+        pendingBatchDelete = []
+        selection.clear()
+    }
+
     /// Show the promo banner only when (a) a non-favorite is being dragged,
     /// (b) there are no Essentials yet, AND (c) the cursor has crossed
-    /// above the active column's space-name label. The fact that
-    /// `spaceNameMaxY` moves down once the banner is open creates natural
-    /// hysteresis — the banner stays open while the cursor lingers in the
-    /// top zone instead of flickering away.
+    /// above the active column's space-name label.
     private var shouldShowAddToEssentialsBanner: Bool {
-        guard session.isActive,
-              session.sourceTier != .favorite,
-              favoriteNotes.isEmpty,
-              let cursorY = session.cursorY else { return false }
-        return cursorY < session.spaceNameMaxY
+        session.showsAddToEssentialsBanner
     }
 
     /// Cross-space — favorites are global. Lives at sidebar level so its
@@ -79,6 +282,150 @@ struct MacNotesSidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            ZStack(alignment: .top) {
+                normalSidebarContent
+                    .opacity(isCreatingSpace ? 0 : 1)
+                    .allowsHitTesting(!isCreatingSpace)
+                    .animation(.easeInOut(duration: 0.18), value: isCreatingSpace)
+
+                if isCreatingSpace {
+                    let activeSpaceID = selectedSpace?.id
+                    MacCreateSpaceForm(
+                        suggestedSortIndex: spaces.count,
+                        cancelToken: cancelCreationTick,
+                        previewGradient: $previewGradient,
+                        onCreate: { space in
+                            isCreatingSpace = false
+                            previewGradient = nil
+                            withAnimation(.smooth(duration: 0.22)) {
+                                selectedSpaceID = space.id
+                            }
+                        },
+                        onCancel: {
+                            isCreatingSpace = false
+                            previewGradient = nil
+                            if selectedSpaceID == nil { selectedSpaceID = activeSpaceID }
+                        }
+                    )
+                    .id("create-space-form")
+                }
+            }
+            .frame(maxHeight: .infinity)
+
+            MacSpaceStrip(
+                spaces: spaces,
+                selectedSpaceID: selectedSpace?.id,
+                isCreatingSpace: isCreatingSpace,
+                canDeleteSpaces: spaces.count > 1,
+                selectSpace: selectSpace,
+                requestDeleteSpace: requestDeleteSpace,
+                onCreateSpace: { isCreatingSpace = true },
+                onCreateFolder: { createFolder() },
+                onCreateNote: createNote,
+                onCancelCreation: { cancelCreationTick &+= 1 },
+                session: session
+            )
+            .padding(.horizontal, 8)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
+        }
+        // Smooth (critically damped) curve for the Essentials-section
+        // grow/shrink. Avoids the slight overshoot a regular spring has,
+        // which can read as a faint "ghost" / "shadow" of the tile around
+        // its disappearing slot.
+        .animation(.smooth(duration: 0.22),
+                   value: EssentialsLayoutKey(
+                       showsBanner: shouldShowAddToEssentialsBanner,
+                       hasEssentials: !favoriteNotes.isEmpty,
+                       count: favoriteNotes.count
+                   ))
+        .frame(width: width)
+        // Intentionally NO tinted background here. MacSpaceBackground +
+        // spaceGradientLayer in MacRootView paint the space color across
+        // the full window edge-to-edge; the docked sidebar must be a
+        // transparent region over that one layer so it reads as part of
+        // the same colored frame as the strip around the workspace pane.
+        // Painting another tint+material on top of it produced two
+        // slightly different shades of the same color and a visible
+        // seam between the sidebar and the surrounding frame.
+        // Floating ghost lives at sidebar level so its `.position(...)` uses
+        // the same "notes-column" coords that `tierFrames` / `cursorY` /
+        // `sourceRowCenter` are written in. Anchoring it to the sidebar
+        // also means it doesn't get clipped by the HStack's `.clipped()`.
+        .overlay(alignment: .topLeading) {
+            if let id = session.draggedNoteID,
+               let note = notes.first(where: { $0.id == id }) {
+                MacSidebarFloatingGhost(
+                    note: note,
+                    activeSpace: selectedSpace,
+                    session: session,
+                    width: width,
+                    sourceAlreadyInFavorites: favoriteNotes.contains { $0.id == id },
+                    isSelected: displayedSelectedNoteID(for: selectedSpace) == id,
+                    draggedNotes: session.draggedNoteIDs.compactMap { did in notes.first { $0.id == did } },
+                    splitPair: {
+                        // Dragging EITHER split member (pill row, plain row, or
+                        // essential tile) → the ghost is the combined pill.
+                        guard let split = activeSplits.first(where: {
+                            id == $0.primaryID || id == $0.secondaryID
+                        }),
+                              let pn = notes.first(where: { $0.id == split.primaryID }),
+                              let sn = notes.first(where: { $0.id == split.secondaryID }) else { return nil }
+                        return (pn, sn)
+                    }(),
+                    pendingPrimary: (id == pendingSplitPrimaryID)
+                        ? notes.first(where: { $0.id == id }) : nil
+                )
+            }
+        }
+        // Shared coord space across the anchored Essentials and the per-
+        // space columns, so tier frames + cursor Y are measured in one
+        // consistent frame of reference.
+        .coordinateSpace(name: "notes-column")
+        .onAppear {
+            syncEssentialsDropZoneVisibility()
+            selection.openNoteID = activeOpenNoteID
+        }
+        .onChange(of: activeOpenNoteID) { _, newValue in
+            selection.openNoteID = newValue
+        }
+        .onChange(of: favoriteNotes.count) { _, _ in
+            syncEssentialsDropZoneVisibility()
+        }
+        .onChange(of: shouldShowAddToEssentialsBanner) { _, _ in
+            syncEssentialsDropZoneVisibility()
+        }
+        .onChange(of: searchResetToken) { _, _ in
+            searchText = ""
+        }
+        // Drives edge auto-switch + drop-on-chip: translation updates every
+        // drag frame, so we re-evaluate the cursor's drag targets here.
+        .onChange(of: session.translation) { _, _ in
+            handleDragOverTargets()
+        }
+        .confirmationDialog(
+            "Delete \(pendingBatchDelete.count) notes?",
+            isPresented: Binding(
+                get: { !pendingBatchDelete.isEmpty },
+                set: { if !$0 { pendingBatchDelete = [] } }
+            )
+        ) {
+            Button("Delete \(pendingBatchDelete.count) Notes", role: .destructive) {
+                commitBatchDelete()
+            }
+            Button("Cancel", role: .cancel) { pendingBatchDelete = [] }
+        } message: {
+            Text("These notes will be permanently deleted.")
+        }
+    }
+
+    private func syncEssentialsDropZoneVisibility() {
+        session.syncFavoriteDropZone(favoriteCount: favoriteNotes.count)
+    }
+
+    @ViewBuilder
+    private var normalSidebarContent: some View {
+        VStack(spacing: 0) {
             MacSidebarCommandField(
                 searchText: $searchText,
                 createNote: createNote,
@@ -95,24 +442,47 @@ struct MacNotesSidebar: View {
                     notes: favoriteNotes,
                     space: activeSpace,
                     allNotes: notes,
-                    selectedNoteID: selectedSpace.flatMap { selectedNoteIDsBySpace[$0.id] },
-                    dragTarget: $dragTarget,
-                    isDragging: $isDragging,
+                    selectedNoteID: displayedSelectedNoteID(for: selectedSpace),
                     selectNote: { note in
-                        if let sp = selectedSpace { selectNote(note, sp) }
+                        if let sp = selectedSpace { openNote(note, in: sp) }
                     },
-                    session: session
+                    session: session,
+                    splitMemberIDs: {
+                        var ids = Set(activeSplits.flatMap { [$0.primaryID, $0.secondaryID] })
+                        if let pid = pendingSplitPrimaryID { ids.insert(pid) }
+                        return ids
+                    }(),
+                    onSplitDrop: onSplitDrop,
+                    selection: selection,
+                    performBatch: performBatch,
+                    openInSplit: openInSplit,
+                    addToSplit: addToSplit
                 )
                 .padding(.horizontal, 10)
                 .padding(.top, 4)
                 .padding(.bottom, 6)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { newHeight in
+                    session.essentialsSectionHeight = newHeight
+                }
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .opacity
+                ))
             } else if shouldShowAddToEssentialsBanner {
                 // No favorites yet — render the Zen-style "Add to Essentials"
                 // promo banner during a non-favorite drag. Pushes the
                 // sidebar down via the .animation(value:) below.
                 addToEssentialsBanner
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    // Asymmetric like the real Essentials row above: slide+fade
+                    // in, but fade out IN PLACE on dismiss. A symmetric move-out
+                    // made the banner slide up while the section collapsed
+                    // underneath it — two fighting motions that read as janky.
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .opacity
+                    ))
             }
 
             // Horizontal track of all space columns, offset by the animated
@@ -124,68 +494,53 @@ struct MacNotesSidebar: View {
                         space: space,
                         notes: notes,
                         folders: folders,
-                        selectedNoteID: selectedNoteIDsBySpace[space.id],
+                        selectedNoteID: displayedSelectedNoteID(for: space),
                         searchText: searchText,
-                        selectNote: { selectNote($0, space) },
+                        selectNote: { openNote($0, in: space) },
                         createNote: createNote,
+                        openCommandPalette: openCommandPalette,
+                        isCommandPaletteActive: isCommandPaletteActive,
                         session: session,
-                        isDragging: $isDragging,
-                        dragTarget: $dragTarget,
-                        isActiveSpace: space.id == selectedSpaceID
+                        selection: selection,
+                        performBatch: performBatch,
+                        renamingFolderID: $renamingFolderID,
+                        isActiveSpace: space.id == selectedSpaceID,
+                        columnWidth: width,
+                        canDeleteSpace: spaces.count > 1,
+                        requestDeleteSpace: requestDeleteSpace,
+                        openManageSpaces: openManageSpaces,
+                        openInSplit: openInSplit,
+                        addToSplit: addToSplit,
+                        onSplitDrop: onSplitDrop,
+                        activeSplits: activeSplits,
+                        pendingSplitPrimaryID: pendingSplitPrimaryID,
+                        dissolveSplit: dissolveSplit,
+                        cancelPendingSplit: cancelPendingSplit
                     )
                     .frame(width: width)
                 }
             }
+            .offset(x: pixelAlignedColumnOffset)
             .frame(width: width, alignment: .leading)
-            .offset(x: -spacePageOffset * width)
             .frame(maxHeight: .infinity)
-            .clipped()
+            .clipShape(MacSpacePageClipShape(trailingBleed: spacePageClipTrailingBleed))
+        }
+    }
 
-            MacSpaceStrip(
-                spaces: spaces,
-                selectedSpaceID: selectedSpace?.id,
-                selectSpace: selectSpace,
-                createSpace: createSpace
-            )
-            .padding(.horizontal, 8)
-            .padding(.top, 6)
-            .padding(.bottom, 6)
-        }
-        // Drives the sidebar's vertical reflow whenever the Essentials
-        // section transitions: banner showing/hiding, grid appearing or
-        // disappearing on a count change. Single tight spring keeps the
-        // banner expansion, banner collapse, grid appearance, and last-
-        // essential-removed grid collapse all using the same curve.
-        .animation(.spring(response: 0.18, dampingFraction: 0.82),
-                   value: EssentialsLayoutKey(
-                       showsBanner: shouldShowAddToEssentialsBanner,
-                       hasEssentials: !favoriteNotes.isEmpty,
-                       count: favoriteNotes.count
-                   ))
-        .frame(width: width)
-        .background {
-            ZStack {
-                if let space = selectedSpace {
-                    Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
-                        .opacity(colorScheme == .dark ? 0.34 : 0.22)
-                }
-                Rectangle().fill(.ultraThinMaterial).opacity(colorScheme == .dark ? 0.40 : 0.30)
-            }
-        }
-        // Floating ghost lives at sidebar level so its `.position(...)` uses
-        // the same "notes-column" coords that `tierFrames` / `cursorY` /
-        // `sourceRowCenter` are written in. Anchoring it to the sidebar
-        // also means it doesn't get clipped by the HStack's `.clipped()`.
-        .overlay(alignment: .topLeading) {
-            if let id = session.draggedNoteID,
-               let note = notes.first(where: { $0.id == id }) {
-                floatingGhost(note: note)
-            }
-        }
-        // Shared coord space across the anchored Essentials and the per-
-        // space columns, so tier frames + cursor Y are measured in one
-        // consistent frame of reference.
-        .coordinateSpace(name: "notes-column")
+    private var pixelAlignedColumnOffset: CGFloat {
+        let rawOffset = -spacePageOffset * width
+        guard displayScale > 0 else { return rawOffset }
+        return (rawOffset * displayScale).rounded() / displayScale
+    }
+
+    private var spacePageClipTrailingBleed: CGFloat {
+        isSpaceSwipeVisuallyActive ? pageClipTrailingBleed : 0
+    }
+
+    private var isSpaceSwipeVisuallyActive: Bool {
+        let distanceFromSettledPage = abs(spacePageOffset - spacePageOffset.rounded()) * width
+        let pixelThreshold = displayScale > 0 ? 0.5 / displayScale : 0.25
+        return distanceFromSettledPage > pixelThreshold
     }
 
     @ViewBuilder
@@ -224,67 +579,9 @@ struct MacNotesSidebar: View {
             proxy.frame(in: .named("notes-column"))
         } action: { newFrame in
             session.tierFrames[.favorite] = newFrame
+            session.updateTarget(rowHeight: CrossTierDragSession.noteRowHeight)
         }
         .animation(.easeInOut(duration: 0.15), value: isTargeted)
-    }
-
-    @ViewBuilder
-    private func floatingGhost(note: Note) -> some View {
-        let asTile = (session.currentTier ?? session.sourceTier) == .favorite
-        let rowWidth = session.tierFrames[session.sourceTier ?? .random]?.width
-            ?? session.tierFrames[.random]?.width
-            ?? session.tierFrames[.pinned]?.width
-            ?? 240
-        Group {
-            if asTile {
-                // Identical layout to the dropped tile in MacEssentialsRow:
-                // VStack(icon + title), 8pt padding, 66pt minHeight,
-                // primary.opacity(0.06) fill + matching stroke. The width
-                // matches a typical grid cell (~88pt for 3 columns at
-                // sidebar width 280).
-                VStack(alignment: .leading, spacing: 8) {
-                    MacNoteMiniIcon(note: note, size: 24)
-                    Text(note.title)
-                        .font(.system(size: 11, weight: .medium))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(Color.primary.opacity(0.82))
-                }
-                .frame(width: 88, alignment: .topLeading)
-                .frame(minHeight: 66, alignment: .topLeading)
-                .padding(8)
-                .background(
-                    Color.primary.opacity(0.06),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-                }
-            } else if let activeSpace = selectedSpace {
-                MacNoteRow(
-                    note: note,
-                    space: activeSpace,
-                    isSelected: false,
-                    showDropIndicator: false,
-                    indicatorColor: .clear,
-                    selectNote: { _ in }
-                )
-                .frame(width: rowWidth)
-                .background(
-                    Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.55 : 0.78),
-                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                )
-            }
-        }
-        .position(
-            x: session.sourceRowCenter.x,
-            y: session.sourceRowCenter.y + session.translation.height
-        )
-        .shadow(color: .black.opacity(0.22), radius: 8, x: 0, y: 4)
-        .opacity(0.95)
-        .allowsHitTesting(false)
-        .animation(.smooth(duration: 0.14), value: asTile)
     }
 
     private func selectSpace(_ space: Space) {
@@ -292,6 +589,356 @@ struct MacNotesSidebar: View {
         withAnimation(.smooth(duration: 0.18)) {
             selectedSpaceID = space.id
         }
+    }
+
+    // MARK: - Drag-over space switching (edges + bottom chips)
+
+    /// While a single note is dragged, switch to another space after a short
+    /// hold when the cursor is over a bottom space chip, or near the sidebar's
+    /// left/right edge — so the note can be dropped there (the session
+    /// re-targets the new active column; release commits a cross-space move).
+    /// Mirrors Zen's `#shouldSwitchSpace` + `handle_spaceIconDragOver`.
+    private func handleDragOverTargets() {
+        // Single-note drags only for now (multi-drag cross-space is unhandled).
+        guard session.isActive, !session.isMulti, let x = session.cursorX else {
+            cancelEdgeSwitch(); return
+        }
+
+        // 1. A bottom space chip under the cursor → quick (0.2s), one-shot jump.
+        if let y = session.cursorY,
+           let hit = session.spaceChipFrames.first(where: { $0.value.contains(CGPoint(x: x, y: y)) }),
+           hit.key != selectedSpaceID {
+            if edgeSwitchTargetID != hit.key {
+                cancelEdgeSwitch()
+                edgeSwitchTargetID = hit.key
+                let id = hit.key
+                let timer = Timer(timeInterval: 0.2, repeats: false) { _ in
+                    guard session.isActive else { return }
+                    switchSpace(toID: id)
+                    cancelEdgeSwitch()
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                edgeSwitchTimer = timer
+            }
+            return
+        }
+
+        // 2. Near the left/right edge → deliberate 1s hold, then REPEAT every
+        //    1s so holding keeps advancing through spaces (no re-arm needed).
+        //    Longer than the chip path so brushing the edge doesn't switch.
+        let padding: CGFloat = 26
+        // Right-edge switch only within the sidebar; past its right edge the
+        // cursor is over the editor (drag-onto-editor split owns that zone).
+        let dir = x <= padding ? -1 : (x >= width - padding && x < width ? 1 : 0)
+        guard dir != 0 else { cancelEdgeSwitch(); return }
+        if edgeSwitchDir != dir || edgeSwitchTargetID != nil {
+            cancelEdgeSwitch()
+            edgeSwitchDir = dir
+            let timer = Timer(timeInterval: 1.0, repeats: true) { _ in
+                guard session.isActive else { return }
+                switchSpace(by: dir)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            edgeSwitchTimer = timer
+        }
+    }
+
+    private func cancelEdgeSwitch() {
+        edgeSwitchTimer?.invalidate()
+        edgeSwitchTimer = nil
+        edgeSwitchTargetID = nil
+        edgeSwitchDir = 0
+    }
+
+    private func switchSpace(toID id: UUID) {
+        guard spaces.contains(where: { $0.id == id }) else { return }
+        withAnimation(.smooth(duration: 0.22)) { selectedSpaceID = id }
+    }
+
+    /// Advance one space in `dir` from the current (no wrap). Used by the
+    /// repeating edge timer so a held edge keeps stepping through spaces.
+    private func switchSpace(by dir: Int) {
+        guard let cur = selectedSpaceID, let idx = spaces.firstIndex(where: { $0.id == cur }) else { return }
+        let next = idx + dir
+        guard next >= 0, next < spaces.count else { return }
+        withAnimation(.smooth(duration: 0.22)) { selectedSpaceID = spaces[next].id }
+    }
+}
+
+private struct MacSpacePageClipShape: Shape {
+    let trailingBleed: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(
+            x: rect.minX,
+            y: rect.minY,
+            width: rect.width + trailingBleed,
+            height: rect.height
+        ))
+    }
+}
+
+private struct MacSidebarFloatingGhost: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let note: Note
+    let activeSpace: Space?
+    let session: CrossTierDragSession
+    let width: CGFloat
+    let sourceAlreadyInFavorites: Bool
+    /// Whether the dragged note is the active space's selected note. When true
+    /// the ghost wears the same elevated pill + bold ink as the resting row,
+    /// so dragging keeps the highlight and the release handoff is seamless
+    /// (no plain-ghost → styled-row pop).
+    let isSelected: Bool
+    /// The full dragged group, in order. For a multi-drag the ghost renders
+    /// these as a contiguous stack of real rows (the grabbed row under the
+    /// cursor); for a single drag it's just `[note]`.
+    var draggedNotes: [Note] = []
+    /// Set when dragging EITHER member of a split (pill, row, or essential
+    /// tile) — the ghost renders the combined tab in (primary, secondary)
+    /// order regardless of which one was grabbed.
+    var splitPair: (Note, Note)? = nil
+    /// Set when dragging the pending pick-mode pill (primary + empty slot).
+    var pendingPrimary: Note? = nil
+
+    private var spaceColor: Color? {
+        guard let s = activeSpace else { return nil }
+        return Color.spaceColor(lightHex: s.colorHex, darkHex: s.darkColorHex, scheme: colorScheme)
+    }
+    private var selectionFill: Color {
+        (spaceColor ?? .accentColor).elevatedSelectionFill(scheme: colorScheme)
+    }
+    private var selectionInk: Color { selectionFill.selectionInk }
+
+    private var asTile: Bool {
+        if let frozen = session.frozenAsTile { return frozen }
+        return (session.currentTier ?? session.sourceTier) == .favorite
+    }
+
+    private var rowWidth: CGFloat {
+        session.tierFrames[session.sourceTier ?? .random]?.width
+            ?? session.tierFrames[.random]?.width
+            ?? session.tierFrames[.pinned]?.width
+            ?? max(160, width - 20)
+    }
+
+    /// Dragged over the editor → the ghost becomes a big page-tile preview
+    /// (like Zen), echoing the note that's about to drop into the split.
+    private var overEditor: Bool {
+        // Cursor inside the editor pane (engaged or middle no-split zone) →
+        // big tile floats over the note, like Arc.
+        session.cursorOverEditor && splitPair == nil && pendingPrimary == nil && !session.isMulti
+    }
+
+    var body: some View {
+        Group {
+            if overEditor {
+                editorTileGhost
+            } else if let pair = splitPair {
+                MacSplitTabRow(primary: pair.0, secondary: pair.1,
+                               showsSeparateIndicator: true,
+                               isFocused: true, tint: spaceColor ?? .accentColor)
+                    .frame(width: rowWidth)
+            } else if let pending = pendingPrimary {
+                // Dragging the pending pick-mode pill: ghost mirrors the combined
+                // primary + "choose a note" placeholder (matches the resting tab).
+                MacSplitTabRow(primary: pending, secondary: nil,
+                               isFocused: true, tint: spaceColor ?? .accentColor)
+                    .frame(width: rowWidth)
+            } else if session.isMulti {
+                // Morphs with the drop target: a stack of tiles over Essentials,
+                // a stack of rows over the list — so the group visibly becomes
+                // tiles/tabs as it crosses the boundary.
+                if asTile { multiTileStack } else { multiRowStack }
+            } else if asTile {
+                tileGhost
+            } else if activeSpace != nil {
+                rowGhost
+            }
+        }
+        .position(x: ghostX, y: ghostCenterY)
+        .animation(.smooth(duration: 0.16), value: overEditor)
+        // Stronger lift while "picked up" (radius 8), easing down to the
+        // resting pill's shadow during the release glide so the handoff to the
+        // real row has no shadow step. `isSettling` flips inside the commit's
+        // withAnimation, so this interpolates over the same 0.18s.
+        .shadow(color: settleShadowColor, radius: settleShadowRadius, x: 0, y: settleShadowY)
+        .allowsHitTesting(false)
+        .animation(.smooth(duration: 0.12), value: asTile)
+    }
+
+    /// Shadow that matches the resting row once settled: the selected pill's
+    /// rest shadow, or nothing for a non-selected row (which has none at rest).
+    private var settleShadowColor: Color {
+        if session.isSettling {
+            return isSelected ? .black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear
+        }
+        return .black.opacity(isSelected ? 0.22 : 0.18)
+    }
+    private var settleShadowRadius: CGFloat {
+        session.isSettling ? (isSelected ? 4 : 0) : 8
+    }
+    private var settleShadowY: CGFloat {
+        session.isSettling ? (isSelected ? 1.5 : 0) : 4
+    }
+
+    private var tileGhost: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MacNoteMiniIcon(note: note, size: 24, ink: isSelected ? selectionInk : nil)
+            Text(note.title)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(isSelected ? selectionInk : Color.primary.opacity(0.82))
+        }
+        .frame(width: ghostTileWidth, alignment: .topLeading)
+        .frame(minHeight: 66, alignment: .topLeading)
+        .padding(8)
+        .background(
+            isSelected ? selectionFill : Color.primary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(
+                    isSelected ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05) : Color.primary.opacity(0.06),
+                    lineWidth: isSelected ? 0.5 : 1
+                )
+        }
+    }
+
+    /// Big floating page-tile shown while dragging over the editor.
+    private var editorTileGhost: some View {
+        VStack(spacing: 14) {
+            MacNoteMiniIcon(note: note, size: 30, ink: nil)
+            Text(note.title)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(3)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Color.primary.opacity(0.85))
+        }
+        .padding(20)
+        .frame(width: 150, height: 200)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                // Translucent so the note + borders read through it (Arc-style).
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.86))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.06), lineWidth: 1)
+        }
+    }
+
+    private var rowGhost: some View {
+        HStack(spacing: 9) {
+            Text(note.title)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .lineLimit(1)
+                .foregroundStyle(isSelected ? selectionInk : Color.primary.opacity(0.86))
+
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
+        .frame(width: rowWidth, height: 32)
+        .background(
+            isSelected
+            ? selectionFill
+            : Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.55 : 0.78),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+    }
+
+    /// Multi-drag ghost: the dragged group rendered as a contiguous stack of
+    /// real selected rows (same 35pt pitch as the list), so it reads as the
+    /// rows "reuniting" and moving together rather than a single proxy.
+    private var multiRowStack: some View {
+        VStack(spacing: 3) {
+            ForEach(draggedNotes, id: \.id) { n in
+                selectedGhostRow(for: n)
+            }
+        }
+    }
+
+    private func selectedGhostRow(for note: Note) -> some View {
+        HStack(spacing: 9) {
+            Text(note.title)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+                .foregroundStyle(selectionInk)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
+        .frame(width: rowWidth, height: 32)
+        .background(selectionFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    /// Center-Y for the floating ghost. Single drag: the row tracks the cursor.
+    /// Multi drag: the stack is offset so the grabbed (primary) group row sits
+    /// at the cursor anchor, with the rest stacked above/below in order.
+    private var ghostCenterY: CGFloat {
+        let anchorY = session.sourceRowCenter.y + session.translation.height
+        guard session.isMulti else { return anchorY }
+        // Tiles cluster HORIZONTALLY (a strip), so no vertical stacking offset —
+        // they stay on one row at the cursor instead of forming a tall column.
+        if asTile { return anchorY }
+        // Rows stack vertically; offset so the grabbed row sits at the cursor.
+        let pitch = CrossTierDragSession.noteRowHeight
+        let content = CrossTierDragSession.noteRowContentHeight
+        let k = session.primaryGroupIndex
+        let totalHeight = CGFloat(session.draggedCount) * pitch - 3
+        return anchorY - (CGFloat(k) * pitch + content / 2) + totalHeight / 2
+    }
+
+    /// Horizontal strip of tiles — matches how they sit in the grid (vs a tall
+    /// vertical column, which felt wrong for same-row selections).
+    private var multiTileStack: some View {
+        HStack(spacing: 7) {
+            ForEach(draggedNotes, id: \.id) { n in selectedGhostTile(for: n) }
+        }
+    }
+
+    private func selectedGhostTile(for note: Note) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MacNoteMiniIcon(note: note, size: 24, ink: selectionInk)
+            Text(note.title)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(selectionInk)
+        }
+        .frame(width: ghostTileWidth, alignment: .topLeading)
+        .frame(minHeight: 66, alignment: .topLeading)
+        .padding(8)
+        .background(selectionFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private var ghostTileWidth: CGFloat {
+        // Locked at release so the @Query-driven count refresh can't
+        // resize the tile mid-snap.
+        if let frozen = session.frozenTileWidth { return frozen }
+        let gridWidth = session.tierFrames[.favorite]?.width ?? 0
+        guard gridWidth > 0 else { return 88 }
+        let stored = session.noteCountsByTier[.favorite] ?? 0
+        let displayCount: Int
+        if session.sourceTier == .favorite || sourceAlreadyInFavorites {
+            displayCount = max(stored, 1)
+        } else {
+            displayCount = stored + 1
+        }
+        return CrossTierDragSession.favoriteCellWidth(gridWidth: gridWidth, count: displayCount) - 16
+    }
+
+    private var ghostX: CGFloat {
+        // Anchor to the grab point (fixed at drag start) + cursor delta, NOT
+        // the active column's live frame. Tying it to the column center made
+        // the ghost jump off-screen and back during a space-switch (the new
+        // column's frame is mid-transition), and reading the grab anchor keeps
+        // the ghost glued to the pointer where you grabbed it.
+        session.sourceRowCenter.x + session.translation.width
     }
 }
 
@@ -378,13 +1025,101 @@ private struct MacSidebarCommandField: View {
 private struct MacSpaceStrip: View {
     let spaces: [Space]
     let selectedSpaceID: UUID?
+    let isCreatingSpace: Bool
+    /// False when only one space remains — deleting the last space is blocked,
+    /// so the chip hides its Delete action.
+    let canDeleteSpaces: Bool
     let selectSpace: (Space) -> Void
-    let createSpace: () -> Void
+    let requestDeleteSpace: (Space) -> Void
+    let onCreateSpace: () -> Void
+    let onCreateFolder: () -> Void
+    let onCreateNote: () -> Void
+    let onCancelCreation: () -> Void
+    /// Drag session — chips report their frames into it so a dragged note can
+    /// hit-test a chip and switch to that space.
+    let session: CrossTierDragSession
 
     @State private var availableWidth: CGFloat = 0
+    @State private var menuOpen: Bool = false
+    @Environment(\.modelContext) private var modelContext
+
+    // Horizontal drag-to-reorder state. Same model as the note reorder:
+    // the base order (`spaces`) is fixed during the drag; the dragged chip
+    // follows the finger (`dragTranslation`) while siblings shift by one
+    // chip-pitch to open its target slot. Chip centers are measured (the
+    // strip uses flexible spacers, so pitch isn't constant) and snapshotted
+    // at drag start into `baseCenters`.
+    @State private var draggingID: UUID?
+    @State private var dragSourceIndex: Int = 0
+    @State private var dragCurrentIndex: Int = 0
+    @State private var dragTranslation: CGFloat = 0
+    @State private var chipCenterX: [UUID: CGFloat] = [:]
+    @State private var baseCenters: [CGFloat] = []
 
     private var layoutMode: SpaceStripMode {
-        SpaceStripMode.determine(count: spaces.count, width: availableWidth)
+        let total = spaces.count + (isCreatingSpace ? 1 : 0)
+        return SpaceStripMode.determine(count: total, width: availableWidth)
+    }
+
+    /// Average distance between adjacent chip centers (snapshotted at drag
+    /// start). Used to shift siblings by exactly one chip when reordering —
+    /// the strip's flexible spacers mean this isn't a fixed constant.
+    private var reorderPitch: CGFloat {
+        guard baseCenters.count > 1 else { return 36 }
+        let span = (baseCenters.max() ?? 0) - (baseCenters.min() ?? 0)
+        return span / CGFloat(baseCenters.count - 1)
+    }
+
+    /// Dragged chip follows the finger; siblings between the source and target
+    /// slots shift one pitch to open the landing gap (horizontal analogue of
+    /// the note-row offset).
+    private func chipOffset(index: Int, id: UUID) -> CGFloat {
+        guard draggingID != nil else { return 0 }
+        if id == draggingID { return dragTranslation }
+        let s = dragSourceIndex, c = dragCurrentIndex
+        if c > s, index > s, index <= c { return -reorderPitch }
+        if c < s, index >= c, index < s { return reorderPitch }
+        return 0
+    }
+
+    private func reorderGesture(space: Space, index: Int) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("space-strip"))
+            .onChanged { value in
+                guard !isCreatingSpace, spaces.count > 1 else { return }
+                if draggingID == nil {
+                    draggingID = space.id
+                    dragSourceIndex = index
+                    dragCurrentIndex = index
+                    baseCenters = spaces.map { chipCenterX[$0.id] ?? 0 }
+                }
+                dragTranslation = value.translation.width
+                let sourceCenter = baseCenters.indices.contains(dragSourceIndex) ? baseCenters[dragSourceIndex] : 0
+                let projected = sourceCenter + dragTranslation
+                var target = 0
+                for (i, center) in baseCenters.enumerated() where i != dragSourceIndex {
+                    if center < projected { target += 1 }
+                }
+                let clamped = min(max(0, target), spaces.count - 1)
+                if clamped != dragCurrentIndex {
+                    withAnimation(.smooth(duration: 0.18)) { dragCurrentIndex = clamped }
+                }
+            }
+            .onEnded { _ in commitReorder() }
+    }
+
+    private func commitReorder() {
+        if draggingID != nil, spaces.indices.contains(dragSourceIndex) {
+            var ids = spaces.map(\.id)
+            let moved = ids.remove(at: dragSourceIndex)
+            ids.insert(moved, at: min(dragCurrentIndex, ids.count))
+            for (i, sid) in ids.enumerated() {
+                spaces.first(where: { $0.id == sid })?.sortIndex = i
+            }
+            try? modelContext.save()
+        }
+        draggingID = nil
+        dragTranslation = 0
+        baseCenters = []
     }
 
     var body: some View {
@@ -395,26 +1130,92 @@ private struct MacSpaceStrip: View {
                         space: space,
                         isSelected: selectedSpaceID == space.id,
                         compact: layoutMode == .compact,
-                        action: { selectSpace(space) }
+                        canDelete: canDeleteSpaces,
+                        action: { selectSpace(space) },
+                        requestDelete: { requestDeleteSpace(space) }
                     )
-                    if index < spaces.count - 1 {
+                    .opacity(draggingID == space.id ? 0.85 : 1)
+                    .offset(x: chipOffset(index: index, id: space.id))
+                    .zIndex(draggingID == space.id ? 1 : 0)
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.frame(in: .named("space-strip")).midX
+                    } action: { chipCenterX[space.id] = $0 }
+                    // Also report the chip frame in the sidebar's coordinate
+                    // space so a dragged note can hit-test it for drop-to-switch.
+                    .onGeometryChange(for: CGRect.self) { proxy in
+                        proxy.frame(in: .named("notes-column"))
+                    } action: { session.spaceChipFrames[space.id] = $0 }
+                    .simultaneousGesture(reorderGesture(space: space, index: index))
+                    if index < spaces.count - 1 || isCreatingSpace {
                         Spacer().frame(minWidth: 1, maxWidth: 8).layoutPriority(-1)
                     }
                 }
+                if isCreatingSpace {
+                    // Placeholder dot for the space being created; Zen
+                    // shows this in screenshot 4 — a 4th dot for the
+                    // unnamed in-creation workspace.
+                    MacSpaceCreationDot()
+                        .transition(.scale.combined(with: .opacity))
+                }
             }
+            .coordinateSpace(name: "space-strip")
             .frame(maxWidth: .infinity)
             .clipped() // safety net: never bleed past the allotted width
             .onGeometryChange(for: CGFloat.self) { proxy in proxy.size.width } action: { availableWidth = $0 }
+            .animation(.smooth(duration: 0.2), value: isCreatingSpace)
 
-            Button(action: createSpace) {
-                Image(systemName: "plus")
-                    .font(.system(size: 13, weight: .semibold))
+            Button {
+                if isCreatingSpace {
+                    onCancelCreation()
+                } else {
+                    menuOpen.toggle()
+                }
+            } label: {
+                ZStack {
+                    Image(systemName: "plus")
+                        .opacity(isCreatingSpace ? 0 : 1)
+                        .rotationEffect(.degrees(isCreatingSpace ? 45 : 0))
+                    Image(systemName: "xmark")
+                        .opacity(isCreatingSpace ? 1 : 0)
+                        .rotationEffect(.degrees(isCreatingSpace ? 0 : -45))
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .animation(.smooth(duration: 0.18), value: isCreatingSpace)
             }
             .buttonStyle(NavButtonStyle())
             .foregroundStyle(.primary)
-            .layoutPriority(1) // plus button never gets squeezed out
-            .help("New space")
+            .layoutPriority(1) // never gets squeezed out
+            .help(isCreatingSpace ? "Cancel" : "New…")
+            .popover(isPresented: $menuOpen, arrowEdge: .top) {
+                MacSidebarNewElementMenu(
+                    onCreateSpace: {
+                        menuOpen = false
+                        onCreateSpace()
+                    },
+                    onCreateFolder: {
+                        menuOpen = false
+                        onCreateFolder()
+                    },
+                    onNewSplit: { menuOpen = false },
+                    onNewTab: {
+                        menuOpen = false
+                        onCreateNote()
+                    }
+                )
+            }
         }
+    }
+}
+
+private struct MacSpaceCreationDot: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Circle()
+            .strokeBorder(.primary.opacity(colorScheme == .dark ? 0.45 : 0.35),
+                          style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+            .frame(width: 8, height: 8)
+            .frame(width: 32, height: 32) // match SpaceChipButtonStyle slot
     }
 }
 
@@ -434,7 +1235,9 @@ private struct MacSpaceChip: View {
     let space: Space
     let isSelected: Bool
     let compact: Bool
+    let canDelete: Bool
     let action: () -> Void
+    let requestDelete: () -> Void
 
     private let dotSize: CGFloat = 6
 
@@ -448,6 +1251,13 @@ private struct MacSpaceChip: View {
         .foregroundStyle(.primary)
         .layoutPriority(isSelected ? 2 : 0) // active chip never shrinks below 32
         .help(space.name)
+        .contextMenu {
+            if canDelete {
+                Button("Delete Space", systemImage: "trash", role: .destructive) {
+                    requestDelete()
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -457,8 +1267,7 @@ private struct MacSpaceChip: View {
                 .fill(.primary.opacity(0.45))
                 .frame(width: dotSize, height: dotSize)
         } else {
-            Text(space.emoji.isEmpty ? "✦" : space.emoji)
-                .font(.system(size: 15))
+            MacSpaceIcon.view(space.emoji, size: 15)
         }
     }
 }
@@ -484,9 +1293,11 @@ private struct SpaceChipButtonStyle: ButtonStyle {
         .frame(maxWidth: size)
         .opacity(isEnabled ? 1.0 : 0.3)
         .scaleEffect(configuration.isPressed && isEnabled ? 0.95 : 1.0)
-        .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
-        .animation(.easeInOut(duration: 0.15), value: isHovering)
-        .onHover { isHovering = $0 }
+        .animation(.easeOut(duration: 0.07), value: configuration.isPressed)
+        .animation(.easeOut(duration: 0.08), value: isHovering)
+        .onHover { hovering in
+            if isHovering != hovering { isHovering = hovering }
+        }
     }
 
     private func backgroundOpacity(isPressed: Bool) -> Double {
@@ -516,9 +1327,11 @@ struct NavButtonStyle: ButtonStyle {
         }
         .opacity(isEnabled ? 1.0 : 0.3)
         .scaleEffect(configuration.isPressed && isEnabled ? 0.95 : 1.0)
-        .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
-        .animation(.easeInOut(duration: 0.15), value: isHovering)
-        .onHover { hovering in isHovering = hovering }
+        .animation(.easeOut(duration: 0.07), value: configuration.isPressed)
+        .animation(.easeOut(duration: 0.08), value: isHovering)
+        .onHover { hovering in
+            if isHovering != hovering { isHovering = hovering }
+        }
     }
 
     private func backgroundOpacity(isPressed: Bool) -> Double {
@@ -530,9 +1343,13 @@ struct NavButtonStyle: ButtonStyle {
 
 // MARK: - Notes column (sections only)
 
-private struct MacSpaceNotesColumn: View {
-    @Environment(\.colorScheme) private var colorScheme
+private struct MacSidebarSplitPair {
+    let primary: Note
+    let secondary: Note
+    let anchorID: UUID
+}
 
+private struct MacSpaceNotesColumn: View {
     let space: Space
     let notes: [Note]
     let folders: [Folder]
@@ -540,97 +1357,241 @@ private struct MacSpaceNotesColumn: View {
     let searchText: String
     let selectNote: (Note) -> Void
     let createNote: () -> Void
+    /// Open the ⌘T palette — the New Note row fires this instead of creating
+    /// directly, so you can title-then-create or run a command.
+    let openCommandPalette: () -> Void
+    /// Palette open → New Note row wears the selected-bar look.
+    let isCommandPaletteActive: Bool
     let session: CrossTierDragSession
-    @Binding var isDragging: Bool
-    @Binding var dragTarget: NoteDropTarget?
+    let selection: NoteSelectionModel
+    let performBatch: (NoteBatchAction) -> Void
+    @Binding var renamingFolderID: UUID?
     let isActiveSpace: Bool
+    let columnWidth: CGFloat
+    let canDeleteSpace: Bool
+    let requestDeleteSpace: (Space) -> Void
+    let openManageSpaces: () -> Void
+    let openInSplit: (Note) -> Void
+    let addToSplit: (Note) -> Void
+    let onSplitDrop: (Note, SplitDropSide) -> Void
+    let activeSplits: [EditorSplit]
+    var pendingSplitPrimaryID: UUID?
+    let dissolveSplit: (UUID, NoteTier, Space) -> Void
+    var cancelPendingSplit: () -> Void = { }
+    private let contentLeadingInset: CGFloat = 10
+    private let contentTrailingInset: CGFloat = 10
 
-    private var hasRandomItems: Bool {
-        !randomNotes.isEmpty || !randomFolders.isEmpty
-    }
+    @Environment(\.modelContext) private var modelContext
+    // Space-edit state, owned here so BOTH the header's ⋯ menu and the
+    // empty-sidebar right-click drive the same pickers / inline rename.
+    @State private var iconPickerOpen = false
+    @State private var themeOpen = false
+    @State private var isRenamingSpace = false
+    @State private var draftName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(space.name)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary.opacity(0.82))
-                .lineLimit(1)
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
-                .padding(.bottom, 6)
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.frame(in: .named("notes-column")).maxY
-                } action: { newValue in
-                    if isActiveSpace { session.spaceNameMaxY = newValue }
-                }
+            MacSpaceHeaderView(
+                space: space,
+                isRenaming: $isRenamingSpace,
+                draftName: $draftName,
+                onCommitRename: commitRename,
+                menuItems: { spaceMenuItems() }
+            )
+            .padding(.horizontal, 8)
+            .padding(.top, 4)
+            .padding(.bottom, 4)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.frame(in: .named("notes-column")).maxY
+            } action: { newValue in
+                if isActiveSpace { session.setSpaceNameMaxY(newValue) }
+            }
+            .popover(isPresented: $iconPickerOpen, arrowEdge: .trailing) {
+                MacIconPicker(selection: iconBinding) { iconPickerOpen = false }
+            }
+            .onChange(of: iconPickerOpen) { _, open in if !open { save() } }
+            .popover(isPresented: $themeOpen, arrowEdge: .trailing) {
+                ZenGradientPicker(config: gradientBinding)
+            }
+            .onChange(of: themeOpen) { _, open in if !open { save() } }
 
             scrollContent
+        }
+        // Right-clicking the empty sidebar area shows the active space's menu
+        // (Arc behaviour). Rows/folders/header carry their own context menus,
+        // which take precedence where they're hit.
+        .frame(maxHeight: .infinity, alignment: .top)
+        .contentShape(Rectangle())
+        .contextMenu { spaceMenuItems() }
+    }
+
+    @ViewBuilder
+    private func spaceMenuItems() -> some View {
+        Button { iconPickerOpen = true } label: { Label("Change Space Icon…", systemImage: "face.smiling") }
+        Button { startRename() } label: { Label("Rename Space…", systemImage: "pencil") }
+        Button { themeOpen = true } label: { Label("Edit Theme Color…", systemImage: "paintpalette") }
+        Button { createFolderHere() } label: { Label("New Folder", systemImage: "folder.badge.plus") }
+        Divider()
+        Button { openManageSpaces() } label: { Label("Manage Spaces…", systemImage: "square.grid.2x2") }
+        if canDeleteSpace {
+            Divider()
+            Button(role: .destructive) { requestDeleteSpace(space) } label: { Label("Delete Space", systemImage: "trash") }
+        }
+    }
+
+    private var iconBinding: Binding<String> {
+        Binding(get: { space.emoji }, set: { space.emoji = $0 })
+    }
+
+    private var gradientBinding: Binding<ZenGradientConfig> {
+        Binding(
+            get: {
+                if let data = space.gradientConfigJSON, let config = ZenGradientConfig.decode(data) {
+                    return config
+                }
+                return .defaultConfig
+            },
+            set: { newValue in
+                space.gradientConfigJSON = ZenGradientConfig.encode(newValue)
+                space.colorHex = newValue.lightHex
+                space.darkColorHex = newValue.darkHex
+            }
+        )
+    }
+
+    private func startRename() {
+        draftName = space.name
+        isRenamingSpace = true
+    }
+
+    private func commitRename() {
+        guard isRenamingSpace else { return }
+        let trimmed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { space.name = trimmed }
+        save()
+        isRenamingSpace = false
+    }
+
+    private func createFolderHere() {
+        if let folder = try? FolderService(context: modelContext).create(in: space, tier: .pinned, parent: nil) {
+            renamingFolderID = folder.id
+        }
+    }
+
+    private func save() {
+        do { try modelContext.save() } catch {
+            assertionFailure("Failed to save space edit: \(error)")
         }
     }
 
     private var scrollContent: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                MacSidebarGroup(
-                    space: space,
-                    allNotes: notes,
-                    notes: pinnedNotes,
-                    folders: pinnedFolders,
-                    selectedNoteID: selectedNoteID,
-                    dragTarget: $dragTarget,
-                    isDragging: $isDragging,
-                    selectNote: selectNote,
-                    tier: .pinned,
-                    session: session,
-                    isActiveSpace: isActiveSpace
-                )
+        ScrollView(.vertical, showsIndicators: false) {
+            // Wrap the LazyVStack in a non-Lazy container so the
+            // `.animation(_:value:)` modifier sits on a view that is NOT
+            // the immediate scroll-content. Putting it directly on the
+            // LazyVStack made SwiftUI capture the ScrollView's
+            // overscroll-bounce as an "animatable layout change" — the
+            // spring damping then conflicted with the native bounce-back
+            // and items would stay displaced instead of snapping back.
+            VStack(spacing: 0) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    MacSidebarGroup(
+                        space: space,
+                        allNotes: notes,
+                        notes: pinnedNotes,
+                        folders: pinnedFolders,
+                        selectedNoteID: selectedNoteID,
+                        selectNote: selectNote,
+                        tier: .pinned,
+                        session: session,
+                        selection: selection,
+                        performBatch: performBatch,
+                        openInSplit: openInSplit,
+                        addToSplit: addToSplit,
+                        onSplitDrop: onSplitDrop,
+                        splitPairs: splitPairs,
+                        pendingSplitPrimaryID: pendingSplitPrimaryID,
+                        dissolveSplit: dissolveSplit,
+                        cancelPendingSplit: cancelPendingSplit,
+                        renamingFolderID: $renamingFolderID,
+                        isActiveSpace: isActiveSpace,
+                        columnWidth: contentWidth
+                    )
 
-                // Hairline separator between the Pinned area and the loose
-                // Notes section. Always visible, regardless of whether either
-                // tier has items — keeps the layout anchored.
-                Rectangle()
-                    .fill(Color.primary.opacity(0.10))
-                    .frame(height: 1)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    // Hairline separator between the Pinned area and the loose
+                    // Notes section. Always visible, regardless of whether either
+                    // tier has items — keeps the layout anchored.
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.10))
+                        .frame(height: 1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
 
-                NewNoteRow(action: createNote)
-                    .padding(.horizontal, 0)
-                    .padding(.top, 2)
-                    .padding(.bottom, 4)
+                    NewNoteRow(action: openCommandPalette,
+                               isActive: isCommandPaletteActive,
+                               space: space)
+                        .padding(.horizontal, 0)
+                        .padding(.top, 2)
+                        .padding(.bottom, 4)
 
-                MacSidebarGroup(
-                    space: space,
-                    allNotes: notes,
-                    notes: randomNotes,
-                    folders: randomFolders,
-                    selectedNoteID: selectedNoteID,
-                    dragTarget: $dragTarget,
-                    isDragging: $isDragging,
-                    selectNote: selectNote,
-                    tier: .random,
-                    session: session,
-                    isActiveSpace: isActiveSpace
-                )
+                    MacSidebarGroup(
+                        space: space,
+                        allNotes: notes,
+                        notes: randomNotes,
+                        folders: randomFolders,
+                        selectedNoteID: selectedNoteID,
+                        selectNote: selectNote,
+                        tier: .random,
+                        session: session,
+                        selection: selection,
+                        performBatch: performBatch,
+                        openInSplit: openInSplit,
+                        addToSplit: addToSplit,
+                        onSplitDrop: onSplitDrop,
+                        splitPairs: splitPairs,
+                        pendingSplitPrimaryID: pendingSplitPrimaryID,
+                        dissolveSplit: dissolveSplit,
+                        cancelPendingSplit: cancelPendingSplit,
+                        renamingFolderID: $renamingFolderID,
+                        isActiveSpace: isActiveSpace,
+                        columnWidth: contentWidth
+                    )
+                }
+                .frame(width: contentWidth, alignment: .leading)
+                .padding(.leading, contentLeadingInset)
+                .padding(.top, 2)
+                .padding(.bottom, 12)
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 2)
-            .padding(.bottom, 12)
-            // Single animation source for the outer column layout: animates
-            // the separator's vertical position (and every sibling's), so
-            // when a tier grows or shrinks during/after a drag, the
-            // separator slides smoothly instead of teleporting.
-            .animation(.spring(response: 0.18, dampingFraction: 0.82),
+            // Animates the separator's vertical position (and every
+            // sibling's) so when a tier grows or shrinks during a drag the
+            // separator slides smoothly instead of teleporting. Gated on
+            // `isActive`: `.animation(value:)` is transaction-independent, so
+            // without the gate it re-fires when the session clears on release
+            // and animates the whole column's reflow — the residual movement
+            // of the other rows after a drop. Nil while inactive → instant.
+                .animation(session.isActive ? .smooth(duration: 0.16) : nil,
                        value: columnLayoutKey)
         }
-        .scrollIndicators(.hidden)
+        // Only bounce when content actually overflows. Without this,
+        // pulling on a short list (typical sidebar state) overscrolls
+        // and SwiftUI's animation transactions on the content captured
+        // the bounce, leaving rows visibly displaced.
+        .scrollBounceBehavior(.basedOnSize)
     }
 
+    private var contentWidth: CGFloat {
+        max(0, columnWidth - contentLeadingInset - contentTrailingInset)
+    }
+
+    /// Only changes during drag/cross-tier transitions, NOT on commit. The
+    /// counts are deliberately excluded so the @Query refresh that lands a
+    /// reorder doesn't trigger the column's layout spring (which would
+    /// otherwise animate the source row's slot move).
     private var columnLayoutKey: String {
         let dragID = session.draggedNoteID?.uuidString ?? ""
         let srcTier = session.sourceTier?.rawValue ?? ""
         let curTier = session.currentTier?.rawValue ?? ""
-        return "\(dragID)|\(srcTier)|\(curTier)|\(pinnedNotes.count)|\(randomNotes.count)"
+        return "\(dragID)|\(srcTier)|\(curTier)"
     }
 
     private var query: String {
@@ -643,24 +1604,43 @@ private struct MacSpaceNotesColumn: View {
             || note.bodyMarkdown.lowercased().contains(query)
     }
 
-    private var favoriteNotes: [Note] {
-        notes
-            .filter { $0.tier == .favorite && matches($0) }
-            .sorted(by: noteSort)
-    }
-
     private var pinnedNotes: [Note] { notesFor(tier: .pinned) }
     private var randomNotes: [Note] { notesFor(tier: .random) }
     private var pinnedFolders: [Folder] { foldersFor(tier: .pinned) }
     private var randomFolders: [Folder] { foldersFor(tier: .random) }
 
-    private var spaceColor: Color {
-        Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
+    /// Every split whose notes belong to this column. The row whose slot
+    /// renders a pair is normally the primary, falling back to the secondary
+    /// when the primary has no visible list row.
+    private var splitPairs: [MacSidebarSplitPair] {
+        activeSplits.compactMap { split in
+            guard let primary = notes.first(where: { $0.id == split.primaryID }),
+                  let secondary = notes.first(where: { $0.id == split.secondaryID }),
+                  // Favorites are global (`space == nil`) — they belong to
+                  // every column. Scope only by each non-favorite member.
+                  (primary.tier == .favorite || primary.space?.id == space.id),
+                  (secondary.tier == .favorite || secondary.space?.id == space.id)
+            else { return nil }
+            let primaryIsRowTile = (primary.tier == .pinned || primary.tier == .random)
+                && primary.space?.id == space.id
+                && primary.folder == nil
+            return MacSidebarSplitPair(
+                primary: primary,
+                secondary: secondary,
+                anchorID: primaryIsRowTile ? primary.id : secondary.id
+            )
+        }
+    }
+    private var hiddenSplitIDs: Set<UUID> {
+        Set(splitPairs.map { pair in
+            pair.anchorID == pair.primary.id ? pair.secondary.id : pair.primary.id
+        })
     }
 
     private func notesFor(tier: NoteTier) -> [Note] {
         notes
-            .filter { $0.tier == tier && $0.space?.id == space.id && $0.folder == nil && matches($0) }
+            .filter { $0.tier == tier && $0.space?.id == space.id && $0.folder == nil
+                && !hiddenSplitIDs.contains($0.id) && matches($0) }
             .sorted(by: noteSort)
     }
 
@@ -668,6 +1648,145 @@ private struct MacSpaceNotesColumn: View {
         folders
             .filter { $0.tier == tier && $0.space?.id == space.id && $0.parent == nil }
             .sorted { $0.sortIndex == $1.sortIndex ? $0.createdAt < $1.createdAt : $0.sortIndex < $1.sortIndex }
+    }
+}
+
+/// Combined sidebar tab for an active split: one pill holding both notes as
+/// sub-tabs and one explicit action that separates them back into rows.
+private struct MacSplitTabRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let primary: Note
+    /// Nil while "Add to Split View" is pending — the second slot shows an
+    /// empty "choose a note" placeholder until one is picked/created.
+    let secondary: Note?
+    /// Tapping the pill focuses the split (shows it in the editor). Ghost
+    /// instances pass nil.
+    var onSelect: (() -> Void)? = nil
+    /// Dissolve the split (separate into two individual tabs).
+    var onSeparate: (() -> Void)? = nil
+    /// Floating drag pills keep the formed split silhouette without exposing
+    /// an active separation action while they are in flight.
+    var showsSeparateIndicator = false
+    /// Whether the split is the focused (shown) editor content.
+    var isFocused: Bool = false
+    /// Pending mode: the × on the empty slot cancels the add-to-split.
+    var onCancelPending: (() -> Void)? = nil
+    /// Space color — when focused the pill wears the same elevated tinted fill
+    /// + shadow as a selected note pill.
+    var tint: Color = .accentColor
+
+    private var elevatedFill: Color { tint.elevatedSelectionFill(scheme: colorScheme) }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            subTab(primary)
+            if let secondary {
+                subTab(secondary)
+                if onSeparate != nil || showsSeparateIndicator {
+                    separateControl
+                }
+            } else {
+                pendingSubTab
+            }
+        }
+        .padding(3)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                // OPAQUE elevated fill when focused so it casts a real shadow
+                // (a translucent fill's shadow is nearly invisible) and matches
+                // a selected note pill.
+                .fill(isFocused ? elevatedFill
+                                : Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.09))
+                .shadow(
+                    color: isFocused ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.16) : .clear,
+                    radius: isFocused ? 5 : 0, x: 0, y: isFocused ? 2 : 0
+                )
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect?() }
+        .contextMenu {
+            if secondary != nil, let onSeparate {
+                Button("Separate Notes", systemImage: "rectangle.split.2x1.slash") { onSeparate() }
+            }
+        }
+    }
+
+    /// The empty second slot shown while waiting for a note to be picked.
+    private var pendingSubTab: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "plus")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.4))
+            Text("Choose a note")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.45))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let onCancelPending {
+                Button { onCancelPending() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.primary.opacity(0.5))
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Cancel split")
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 3)
+        .frame(maxWidth: .infinity)
+        .frame(height: 30)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.22),
+                              style: StrokeStyle(lineWidth: 1.2, dash: [4, 3]))
+        )
+    }
+
+    private func subTab(_ note: Note) -> some View {
+        HStack(spacing: 7) {
+            MacNoteMiniIcon(note: note, size: 16)
+            Text(note.title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.85))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 7)
+        .padding(.trailing, 7)
+        .frame(maxWidth: .infinity)
+        .frame(height: 30)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.5 : 0.92))
+        )
+    }
+
+    @ViewBuilder
+    private var separateControl: some View {
+        if let onSeparate {
+            SoftHoverChipButton(help: "Separate notes", action: onSeparate) { hovering in
+                Image(systemName: "rectangle.split.2x1.slash")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(hovering ? 0.9 : 0.58))
+                    .frame(width: 24, height: 30)
+            }
+            .accessibilityLabel("Separate notes")
+        } else {
+            separateIcon
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var separateIcon: some View {
+        Image(systemName: "rectangle.split.2x1.slash")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.primary.opacity(0.58))
+            .frame(width: 24, height: 30)
+            .contentShape(Rectangle())
     }
 }
 
@@ -707,31 +1826,64 @@ private struct MacSidebarSectionLabel: View {
 private struct NewNoteRow: View {
     @Environment(\.colorScheme) private var colorScheme
     let action: () -> Void
+    /// While the ⌘T palette is open this row reads as the active selection
+    /// (like Arc highlighting "New Tab" when its command bar is up).
+    var isActive: Bool = false
+    /// Used to tint the active-state bar to match the space's selected-row tone.
+    var space: Space? = nil
     @State private var isHovering = false
+
+    private var activeFill: Color {
+        let base = space.map {
+            Color.spaceColor(lightHex: $0.colorHex, darkHex: $0.darkColorHex, scheme: colorScheme)
+        } ?? .accentColor
+        return base.elevatedSelectionFill(scheme: colorScheme)
+    }
+    private var activeInk: Color { activeFill.selectionInk }
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "plus")
                 .font(.system(size: 11, weight: .bold))
                 .frame(width: 20, height: 20)
-                .foregroundStyle(.primary.opacity(0.78))
+                .foregroundStyle(isActive ? activeInk.opacity(0.9) : .primary.opacity(0.78))
 
             Text("New Note")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.82))
+                .foregroundStyle(isActive ? activeInk : .primary.opacity(0.82))
 
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 8)
+        // Match MacNoteRow's selected pill EXACTLY: same leading/trailing
+        // insets, height, corner radius (9), hairline stroke and shadow — so
+        // the active New Note bar is indistinguishable from a selected note.
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
         .frame(height: 32)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(.primary.opacity(isHovering ? (colorScheme == .dark ? 0.12 : 0.06) : 0))
-        )
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isActive
+                      ? activeFill
+                      : .primary.opacity(isHovering ? (colorScheme == .dark ? 0.10 : 0.07) : 0))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(
+                            isActive ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05) : .clear,
+                            lineWidth: 0.5
+                        )
+                }
+                .shadow(
+                    color: isActive ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear,
+                    radius: isActive ? 4 : 0, x: 0, y: isActive ? 1.5 : 0
+                )
+        }
         .contentShape(Rectangle())
         .onTapGesture { action() }
-        .onHover { isHovering = $0 }
-        .animation(.easeInOut(duration: 0.12), value: isHovering)
+        .onHover { hovering in
+            if isHovering != hovering { isHovering = hovering }
+        }
+        .animation(.easeOut(duration: 0.12), value: isActive)
+        .animation(.easeOut(duration: 0.08), value: isHovering)
     }
 }
 
@@ -742,13 +1894,63 @@ private struct MacEssentialsRow: View {
     let space: Space
     let allNotes: [Note]
     let selectedNoteID: UUID?
-    @Binding var dragTarget: NoteDropTarget?
-    @Binding var isDragging: Bool
     let selectNote: (Note) -> Void
     let session: CrossTierDragSession
+    /// Notes currently in a split — their Essentials tile is dimmed + badged
+    /// because the live split pill lives in the row list below.
+    var splitMemberIDs: Set<UUID> = []
+    /// Release a dragged tile over the editor → split the open note with it.
+    var onSplitDrop: (Note, SplitDropSide) -> Void = { _, _ in }
+    /// Shared multi-select set (⌘/⇧-click) + batch action, mirroring the rows.
+    let selection: NoteSelectionModel
+    var performBatch: (NoteBatchAction) -> Void = { _ in }
+    var openInSplit: (Note) -> Void = { _ in }
+    var addToSplit: (Note) -> Void = { _ in }
 
     private var spaceColor: Color {
         Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
+    }
+
+    /// ⌘ toggles membership, ⇧ selects a range over the favorites order, plain
+    /// opens the note. Reads live modifier flags (composes with the tap).
+    private func handleTileClick(_ note: Note) {
+        #if canImport(AppKit)
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) { selection.toggle(note.id); return }
+        if flags.contains(.shift) { selection.selectRange(to: note.id, in: notes.map(\.id)); return }
+        #endif
+        selectNote(note)
+    }
+
+    @ViewBuilder
+    private func tileMenu(_ note: Note) -> some View {
+        if selection.count > 1, selection.contains(note.id) {
+            let n = selection.count
+            if n == 2 {
+                Button("Open in Split View", systemImage: "rectangle.split.2x1") { performBatch(.openSplit) }
+                Divider()
+            }
+            Button("Pin \(n) Notes", systemImage: "pin.fill") { performBatch(.pin) }
+            Button("Move \(n) to Notes", systemImage: "tray") { performBatch(.moveToNotes) }
+            Divider()
+            Button("Duplicate \(n) Notes", systemImage: "plus.square.on.square") { performBatch(.duplicate) }
+            Button("Archive \(n) Notes", systemImage: "archivebox") { performBatch(.archive) }
+            Button("Delete \(n) Notes", systemImage: "trash", role: .destructive) { performBatch(.delete) }
+        } else {
+            Button("Open", systemImage: "doc.text") { selectNote(note) }
+            if selectedNoteID == note.id {
+                Button("Add to Split View", systemImage: "rectangle.split.2x1") { addToSplit(note) }
+            } else {
+                Button("Open in Split View", systemImage: "rectangle.split.2x1") { openInSplit(note) }
+            }
+            Divider()
+            Button("Pin", systemImage: "pin.fill") { try? NoteService(context: modelContext).promote(note, to: .pinned, currentSpace: space) }
+            Button("Move to Notes", systemImage: "tray") { try? NoteService(context: modelContext).promote(note, to: .random, currentSpace: space) }
+            Divider()
+            Button("Duplicate", systemImage: "plus.square.on.square") { _ = try? NoteService(context: modelContext).duplicate(note) }
+            Button("Archive", systemImage: "archivebox") { try? NoteService(context: modelContext).archive(note) }
+            Button("Delete", systemImage: "trash", role: .destructive) { try? NoteService(context: modelContext).delete(note) }
+        }
     }
 
     private var isCrossTierTarget: Bool {
@@ -757,35 +1959,147 @@ private struct MacEssentialsRow: View {
             && session.currentTier == .favorite
     }
 
-    private let rowHeight: CGFloat = 35
+    private let rowHeight = CrossTierDragSession.noteRowHeight
+
+    /// Live-reorder display list. When the user is dragging a note over
+    /// the Essentials grid (either an existing favorite being reordered,
+    /// or a row from another tier being promoted), the dragged note is
+    /// placed at `session.currentIndex` and the rest shift around it.
+    private var visualNotes: [Note] {
+        if session.isMulti {
+            // Lift the dragged set out of the grid (the stack ghost carries it).
+            var base = Array(notes.prefix(8)).filter { !session.isDragged($0.id) }
+            // Over Essentials (reorder/promote target): reserve the group's
+            // cells at the grid hit-test index so the grid opens a gap that
+            // tracks the cursor (cells render at opacity 0 via `isSource`).
+            if session.isActive, session.currentTier == .favorite {
+                let movers = session.draggedNoteIDs.compactMap { id in allNotes.first { $0.id == id } }
+                let idx = min(max(0, session.currentIndex), base.count)
+                base.insert(contentsOf: movers, at: idx)
+            }
+            return Array(base.prefix(8))
+        }
+        let displayed = Array(notes.prefix(8))
+        guard session.isActive, session.currentTier == .favorite else {
+            return displayed
+        }
+        // Within-Essentials reorder: source is already in `notes`.
+        if session.sourceTier == .favorite,
+           let id = session.draggedNoteID,
+           let sourceIdx = displayed.firstIndex(where: { $0.id == id }) {
+            var result = displayed
+            let moved = result.remove(at: sourceIdx)
+            result.insert(moved, at: min(session.currentIndex, result.count))
+            return result
+        }
+        // Cross-tier promotion in progress: source isn't in favorites yet,
+        // but the user has the cursor over the grid. Insert a placeholder
+        // at currentIndex so the other tiles reflow to show the landing
+        // slot. The inserted note's tier is still its original (.pinned /
+        // .random), so `isSource` returns true → rendered opacity 0.
+        if session.sourceTier != .favorite,
+           let id = session.draggedNoteID,
+           let sourceNote = allNotes.first(where: { $0.id == id }) {
+            // If the data commit has already landed (between
+            // `performMove` and `session.reset`), the source is now in
+            // `displayed` naturally — inserting again would render the
+            // same id twice and produce a one-frame flicker on release.
+            if displayed.contains(where: { $0.id == id }) {
+                return displayed
+            }
+            var result = displayed
+            result.insert(sourceNote, at: min(session.currentIndex, result.count))
+            return Array(result.prefix(8))
+        }
+        return displayed
+    }
+
+    private var gridColumns: [GridItem] {
+        // Honor the frozen column count through a promote's commit so
+        // the grid doesn't briefly relayout to a wider, fewer-column
+        // state while @Query catches up.
+        let n = session.frozenFavoriteColumnCount
+            ?? CrossTierDragSession.favoriteColumnCount(for: max(visualNotes.count, 1))
+        return Array(repeating: GridItem(.flexible(), spacing: 7), count: n)
+    }
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 7)], spacing: 7) {
-            ForEach(Array(notes.prefix(8).enumerated()), id: \.element.id) { index, note in
-                let isSelected = selectedNoteID == note.id
-                let isSource = session.draggedNoteID == note.id && session.sourceTier == .favorite
+        LazyVGrid(columns: gridColumns, spacing: 7) {
+            ForEach(visualNotes, id: \.id) { note in
+                let originalIndex = notes.firstIndex { $0.id == note.id } ?? 0
+                // Highlighted when multi-selected, else when it's the open note.
+                // A split member's focus lives in the row-list pill, so its
+                // tile drops the "selected" treatment and just reads as dimmed.
+                let isSelected = (selection.isActive ? selection.contains(note.id) : selectedNoteID == note.id)
+                    && !splitMemberIDs.contains(note.id)
+                // Hide the dragged note's real cell for the WHOLE drag +
+                // snap, regardless of its committed tier. During a
+                // promote the commit lands mid-snap and flips the note's
+                // tier to .favorite — without this guard `isSource` went
+                // false and the real grid tile appeared *while the ghost
+                // was still flying in*, producing a double-render that
+                // read as a width glitch. The cell reappears only when
+                // `session.reset()` clears `draggedNoteID`.
+                let isSource = session.isDragged(note.id)
+                    || session.draggedNoteID == note.id
+                    || note.tier != .favorite
+                // In a split: the live pill lives in the row list, so dim this
+                // tile + badge it to show the link without duplicating focus.
+                let inSplit = splitMemberIDs.contains(note.id)
 
+                let tileFill = spaceColor.elevatedSelectionFill(scheme: colorScheme)
+                let tileInk = tileFill.selectionInk
                 VStack(alignment: .leading, spacing: 8) {
-                    MacNoteMiniIcon(note: note, size: 24)
+                    MacNoteMiniIcon(note: note, size: 24, ink: isSelected ? tileInk : nil)
                     Text(note.title)
                         .font(.system(size: 11, weight: .medium))
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
-                        .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(0.82))
+                        .foregroundStyle(isSelected ? tileInk : Color.primary.opacity(0.82))
                 }
                 .frame(maxWidth: .infinity, minHeight: 66, alignment: .topLeading)
                 .padding(8)
-                .background(isSelected ? spaceColor.opacity(0.85) : Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(isSelected ? Color.white.opacity(0.30) : Color.primary.opacity(0.06), lineWidth: 1)
+                .background {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(isSelected ? tileFill : Color.primary.opacity(0.06))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(
+                                    isSelected
+                                    ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
+                                    : Color.primary.opacity(0.06),
+                                    lineWidth: isSelected ? 0.5 : 1
+                                )
+                        }
+                        .shadow(
+                            color: isSelected ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear,
+                            radius: isSelected ? 4 : 0, x: 0, y: isSelected ? 1.5 : 0
+                        )
                 }
+                .overlay(alignment: .topTrailing) {
+                    if inSplit {
+                        Image(systemName: "rectangle.split.2x1.fill")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.primary.opacity(0.5))
+                            .padding(5)
+                    }
+                }
+                .opacity(inSplit ? 0.55 : 1)
                 .opacity(isSource ? 0 : 1)
                 .contentShape(Rectangle())
-                .onTapGesture { selectNote(note) }
-                .gesture(tileDragGesture(for: note, at: index))
+                .onTapGesture { handleTileClick(note) }
+                .gesture(tileDragGesture(for: note, at: originalIndex))
+                .contextMenu { tileMenu(note) }
             }
         }
+        // Animate the live reorder reflow on `currentIndex` / count only.
+        // Deliberately NOT keyed on `draggedNoteID`: including it made
+        // `session.reset()` on release fire a second grid animation that
+        // raced the ghost's snap, producing the pre-snap glitch. Without
+        // it, release is a clean instant handoff — the ghost snaps, then
+        // the committed tile appears in place with no competing reflow.
+        .animation(.smooth(duration: 0.18),
+                   value: "\(session.currentIndex)|\(visualNotes.count)")
         .padding(2)
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -797,10 +2111,27 @@ private struct MacEssentialsRow: View {
         } action: { newFrame in
             session.tierFrames[.favorite] = newFrame
         }
-        .onAppear { session.noteCountsByTier[.favorite] = notes.count }
+        .onAppear {
+            session.noteCountsByTier[.favorite] = notes.count
+            releaseColumnFreezeIfSettled(count: notes.count)
+        }
         .onChange(of: notes.count) { _, newValue in
             session.noteCountsByTier[.favorite] = newValue
+            releaseColumnFreezeIfSettled(count: newValue)
         }
+    }
+
+    /// Clears the column-count freeze once the live count produces the
+    /// same column layout — i.e. @Query has caught up to the post-commit
+    /// favorites count. Checked from both onAppear (covers promoting into
+    /// a previously-empty Essentials, where this row mounts fresh) and
+    /// onChange. No visible resize since the layout already matches.
+    private func releaseColumnFreezeIfSettled(count: Int) {
+        guard let frozen = session.frozenFavoriteColumnCount,
+              CrossTierDragSession.favoriteColumnCount(for: max(count, 1)) == frozen else { return }
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) { session.frozenFavoriteColumnCount = nil }
     }
 
     /// Essentials grid is a 2D layout, so we don't run any within-grid
@@ -810,66 +2141,274 @@ private struct MacEssentialsRow: View {
         DragGesture(minimumDistance: 2, coordinateSpace: .named("notes-column"))
             .onChanged { value in
                 if session.draggedNoteID == nil {
+                    session.dragGeneration &+= 1
                     session.draggedNoteID = note.id
+                    // Multi-tile drag: the whole selection moves together (e.g.
+                    // demote a batch of essentials to Notes). Else a single tile.
+                    if selection.contains(note.id), selection.count > 1 {
+                        session.draggedNoteIDs = allNotes
+                            .filter { selection.contains($0.id) }
+                            .sorted(by: noteSort)
+                            .map(\.id)
+                    } else {
+                        session.draggedNoteIDs = [note.id]
+                    }
                     session.sourceTier = .favorite
+                    session.sourceSpaceID = space.id
                     session.sourceIndex = index
                     session.currentTier = .favorite
                     session.currentIndex = index
-                    // Anchor the floating ghost to a row tier's horizontal
-                    // center so that, once it morphs into a row, it sits in
-                    // exactly the same X column as a normal Pinned/Notes
-                    // drag — not pushed against the left edge by wherever
-                    // the cursor happened to grab inside the grid tile.
-                    let rowMidX = session.tierFrames[.random]?.midX
-                        ?? session.tierFrames[.pinned]?.midX
-                        ?? value.startLocation.x
-                    session.sourceRowCenter = CGPoint(x: rowMidX, y: value.startLocation.y)
+                    session.sourceRowCenter = essentialsCellCenter(forIndex: index)
+                        ?? value.startLocation
                     session.noteCountsByTier[.favorite] = notes.count
-                    isDragging = true
                 }
-                session.cursorY = value.location.y
-                session.translation = CGSize(width: 0, height: value.translation.height)
-                session.updateTarget(rowHeight: rowHeight)
+                // 2D translation — both axes so the ghost can move freely
+                // through the grid while reshuffling other tiles.
+                session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
             }
-            .onEnded { _ in commitTileDrag() }
+            .onEnded { _ in
+                let stuckID = session.draggedNoteID
+                let gen = session.dragGeneration
+                commitTileDrag()
+                session.scheduleWatchdog(for: stuckID, generation: gen)
+            }
+    }
+
+    /// Returns the visual center of the cell at `index` in the Essentials
+    /// grid, in `"notes-column"` coords. Returns nil if the grid frame
+    /// hasn't been measured yet.
+    private func essentialsCellCenter(forIndex index: Int) -> CGPoint? {
+        let frame = session.tierFrames[.favorite] ?? .zero
+        guard frame.width > 0 else { return nil }
+        let spacing = CrossTierDragSession.favoriteCellSpacing
+        let pad = CrossTierDragSession.favoriteGridPadding
+        let cellH = CrossTierDragSession.favoriteCellHeight
+        let count = max(notes.count, 1)
+        let N = CrossTierDragSession.favoriteColumnCount(for: count)
+        let cellW = CrossTierDragSession.favoriteCellWidth(gridWidth: frame.width, count: count)
+        let col = index % N
+        let row = index / N
+        return CGPoint(
+            x: frame.minX + pad + CGFloat(col) * (cellW + spacing) + cellW / 2,
+            y: frame.minY + pad + CGFloat(row) * (cellH + spacing) + cellH / 2
+        )
     }
 
     private func commitTileDrag() {
+        // Multi-tile drag → demote the whole selection to the target list tier
+        // (favorites isn't a multi-drop target, so a release over the grid just
+        // snaps the stack back). Mirrors the row multi-drag commit.
+        if session.isMulti { commitMultiTileDrag(); return }
         guard let id = session.draggedNoteID,
-              let source = allNotes.first(where: { $0.id == id }),
-              let dest = session.currentTier else {
+              let source = allNotes.first(where: { $0.id == id }) else {
+            wipe()
+            return
+        }
+        // Released over the editor → make a split, NOT a grid reorder/demote.
+        // Must short-circuit BEFORE the settle animation below: the editor's
+        // split-preview relayout can interrupt that animation's completion,
+        // leaving the session never reset (every later drag then jams).
+        if let side = session.editorDropSide {
+            onSplitDrop(source, side)
+            wipe()
+            return
+        }
+        guard let dest = session.currentTier else {
             wipe()
             return
         }
         let destIndex = session.currentIndex
         let crossTier = dest != .favorite
 
-        let destFrame = session.tierFrames[dest] ?? .zero
-        let targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight + rowHeight / 2
-        let targetTranslationY = targetCenterY - session.sourceRowCenter.y
+        // Freeze the floating tile's width to its FINAL resting width so
+        // the @Query refresh (which mutates noteCountsByTier the instant
+        // we commit below) can't resize the ghost mid-snap. Only relevant
+        // when landing in the Essentials grid (tile shape).
+        // Lock the ghost's shape for the whole snap. Landing in
+        // Essentials = tile; anywhere else = row. Prevents the
+        // mid-settle shape flash.
+        session.frozenAsTile = (dest == .favorite)
 
-        withAnimation(.spring(response: 0.16, dampingFraction: 0.88)) {
-            session.translation = CGSize(width: 0, height: targetTranslationY)
-        } completion: {
-            if crossTier {
-                withAnimation(.spring(response: 0.18, dampingFraction: 0.82)) {
-                    performDemote(to: dest, destIndex: destIndex, noteID: id)
-                }
+        if dest == .favorite, let gw = session.tierFrames[.favorite]?.width, gw > 0 {
+            // Reorder keeps the count; promote adds one.
+            let isPromote = session.sourceTier != .favorite
+            let finalCount = isPromote ? notes.count + 1 : notes.count
+            session.frozenTileWidth = CrossTierDragSession.favoriteCellWidth(
+                gridWidth: gw, count: max(finalCount, 1)
+            ) - 16
+            // For a promote, also lock the grid's column count to the
+            // post-commit value so the whole grid doesn't resize during
+            // the @Query lag. Cleared once notes.count catches up.
+            if isPromote {
+                session.frozenFavoriteColumnCount =
+                    CrossTierDragSession.favoriteColumnCount(for: max(finalCount, 1))
             }
-            // Defer session.reset so `@Query` has a chance to refresh
-            // `favoriteNotes` first. Otherwise `isSource` flips to false
-            // (because session.draggedNoteID becomes nil) while the
-            // source tile is still in `notes`, causing the tile to flash
-            // visible at opacity 1 before the grid is removed.
+        }
+
+        let destFrame = session.tierFrames[dest] ?? .zero
+        // For grid destinations (within-Essentials reorder), pick the
+        // target cell's center. For row destinations (demote), use the
+        // row slot's Y midpoint.
+        let targetCenterX: CGFloat
+        let targetCenterY: CGFloat
+        if dest == .favorite, let cell = essentialsCellCenter(forIndex: destIndex) {
+            targetCenterX = cell.x
+            targetCenterY = cell.y
+        } else {
+            targetCenterX = destFrame.midX
+            targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight + rowHeight / 2
+        }
+
+        // If this is the last essential and we're moving it OUT, the
+        // sidebar will collapse by `essentialsSectionHeight` once
+        // `favoriteNotes` empties. Pre-shift the ghost's target by the
+        // same amount so it lands on the slot's POST-collapse position —
+        // letting us fire the data commit in parallel with the ghost
+        // spring (instead of after it).
+        let essentialsWillEmpty = crossTier && notes.count == 1
+        let shift: CGFloat = essentialsWillEmpty ? session.essentialsSectionHeight : 0
+        let targetTranslationX = targetCenterX - session.sourceRowCenter.x
+        let targetTranslationY = (targetCenterY - shift) - session.sourceRowCenter.y
+
+        if crossTier {
+            // Demote: fire data commit immediately so the
+            // EssentialsLayoutKey spring starts in parallel.
+            performDemote(to: dest, destIndex: destIndex, noteID: id)
+        } else if destIndex != session.sourceIndex {
+            // Within-Essentials reorder: rebuild manualSortIndex now so
+            // the grid lands silently when session.reset clears (the
+            // visualNotes already shows the target order during drag).
+            reorderFavorites(noteID: id, toIndex: destIndex)
+        }
+
+        // Match the grid's reflow curve (0.18) so the ghost and any
+        // settling tiles move in lockstep instead of arriving at
+        // different times.
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(
+                width: dest == .favorite ? targetTranslationX : 0,
+                height: targetTranslationY
+            )
+        } completion: {
+            // Defer session.reset so `@Query` refreshes `favoriteNotes`
+            // first — otherwise the source tile briefly becomes visible
+            // again before the grid is removed.
             DispatchQueue.main.async {
                 var tx = Transaction()
                 tx.disablesAnimations = true
                 withTransaction(tx) {
                     session.reset()
                 }
-                isDragging = false
             }
         }
+    }
+
+    /// Release path for a multi-TILE drag — demote the dragged set as a block
+    /// into the target list tier. Mirrors `MacSidebarGroup.commitMultiDrag`
+    /// (favorites isn't a multi-drop target → snap back).
+    private func commitMultiTileDrag() {
+        guard let dest = session.currentTier else { wipe(); return }
+        let ids = session.draggedNoteIDs
+        // Reorder/keep the group WITHIN Essentials at the grid hit-test index.
+        // Glide the strip so the grabbed tile lands on its target cell (snaps
+        // back when released far from the slot, like tabs/spaces).
+        if dest == .favorite {
+            let destIndex = session.currentIndex
+            let count = max(notes.count, 1)
+            let targetIndex = min(max(0, destIndex + session.primaryGroupIndex), count - 1)
+            session.frozenAsTile = true
+            if let cell = essentialsCellCenter(forIndex: targetIndex) {
+                let frame = session.tierFrames[.favorite] ?? .zero
+                let cellW = CrossTierDragSession.favoriteCellWidth(gridWidth: frame.width, count: count)
+                let pitch = cellW + CrossTierDragSession.favoriteCellSpacing
+                // Grabbed tile's offset within the centered horizontal strip.
+                let grabbedOffsetX = (CGFloat(session.primaryGroupIndex)
+                    - CGFloat(session.draggedCount - 1) / 2) * pitch
+                let target = CGSize(
+                    width: cell.x - grabbedOffsetX - session.sourceRowCenter.x,
+                    height: cell.y - session.sourceRowCenter.y
+                )
+                withAnimation(.smooth(duration: 0.2)) {
+                    session.isSettling = true
+                    session.translation = target
+                } completion: {
+                    performMoveMultiTile(ids: ids, dest: .favorite, destIndex: destIndex)
+                    var t = Transaction(); t.disablesAnimations = true
+                    withTransaction(t) { session.reset() }
+                }
+            } else {
+                performMoveMultiTile(ids: ids, dest: .favorite, destIndex: destIndex)
+                wipe()
+            }
+            return
+        }
+        let rawDestIndex = max(0, session.currentIndex - session.primaryGroupIndex)
+        let destVisibleCount = allNotes.filter {
+            $0.tier == dest && $0.space?.id == space.id && $0.folder == nil && !session.isDragged($0.id)
+        }.count
+        let destIndex = min(rawDestIndex, destVisibleCount)
+
+        // Land as rows (not tiles).
+        session.frozenAsTile = false
+        let destFrame = session.tierFrames[dest] ?? .zero
+        let primaryLandedSlot = destIndex + session.primaryGroupIndex
+        let primaryTargetCenterY = destFrame.minY
+            + CGFloat(primaryLandedSlot) * rowHeight
+            + CrossTierDragSession.noteRowContentHeight / 2
+        let targetTranslationY = primaryTargetCenterY - session.sourceRowCenter.y
+
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(width: 0, height: targetTranslationY)
+        } completion: {
+            performMoveMultiTile(ids: ids, dest: dest, destIndex: destIndex)
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) { session.reset() }
+        }
+    }
+
+    private func performMoveMultiTile(ids: [UUID], dest: NoteTier, destIndex: Int) {
+        let movers = ids.compactMap { id in allNotes.first { $0.id == id } }
+        guard !movers.isEmpty else { return }
+        for m in movers {
+            m.tier = dest
+            m.space = dest == .favorite ? nil : space   // favorites are global
+            m.folder = nil
+        }
+        let destOthers = allNotes
+            .filter { $0.tier == dest && (dest == .favorite || $0.space?.id == space.id) && $0.folder == nil && !ids.contains($0.id) }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        var reordered = destOthers
+        let insertIdx = min(max(0, destIndex), reordered.count)
+        reordered.insert(contentsOf: movers, at: insertIdx)
+        for (i, n) in reordered.enumerated() { n.manualSortIndex = i }
+
+        // Renumber the row tiers the group left behind.
+        for srcTier in [NoteTier.pinned, .random] where srcTier != dest {
+            let remaining = allNotes
+                .filter { $0.tier == srcTier && $0.space?.id == space.id && $0.folder == nil && !ids.contains($0.id) }
+                .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+            for (i, n) in remaining.enumerated() { n.manualSortIndex = i }
+        }
+
+        let now = Date()
+        for m in movers { m.updatedAt = now }
+        try? modelContext.save()
+    }
+
+    private func reorderFavorites(noteID: UUID, toIndex: Int) {
+        let favorites = allNotes
+            .filter { $0.tier == .favorite && $0.folder == nil }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        guard let source = favorites.first(where: { $0.id == noteID }) else { return }
+        var reordered = favorites.filter { $0.id != noteID }
+        let insertIdx = min(toIndex, reordered.count)
+        reordered.insert(source, at: insertIdx)
+        for (i, n) in reordered.enumerated() { n.manualSortIndex = i }
+        source.updatedAt = Date()
+        try? modelContext.save()
     }
 
     private func performDemote(to dest: NoteTier, destIndex: Int, noteID: UUID) {
@@ -895,32 +2434,7 @@ private struct MacEssentialsRow: View {
         withTransaction(tx) {
             session.reset()
         }
-        isDragging = false
     }
-}
-
-/// Shared drag-over state for the entire notes column. Identifies which row
-/// (or tier-end slot) the dragged item is currently hovering, so we can show
-/// a precise drop indicator before commit. Used by the cross-tier
-/// `.draggable`-based system.
-struct NoteDropTarget: Equatable {
-    enum Anchor: Equatable {
-        case beforeRow(UUID)
-        case tierEnd(NoteTier)
-    }
-    let tier: NoteTier
-    let anchor: Anchor
-}
-
-/// Per-tier drag state for the live in-place reorder system. Each
-/// `MacSidebarGroup` owns one; while non-nil the dragged row follows the
-/// cursor via `translation.height` and sibling rows in the same tier shift
-/// by ±rowHeight to reveal where the drop will land.
-struct WithinTierDrag: Equatable {
-    let noteID: UUID
-    let startIndex: Int
-    var currentIndex: Int
-    var translation: CGSize
 }
 
 /// Lightweight shared session for detecting cross-tier drag intent. The
@@ -939,22 +2453,130 @@ final class CrossTierDragSession {
     var sourceIndex: Int = 0
     var sourceRowCenter: CGPoint = .zero
 
+    /// The full ordered set of notes being dragged. For a single drag this is
+    /// just `[draggedNoteID]`; for a multi-drag it's the whole selection in
+    /// display order, with `draggedNoteID` the grabbed "primary" row that the
+    /// ghost anchors to. Multi-specific layout/commit branches key off this.
+    var draggedNoteIDs: [UUID] = []
+    var isMulti: Bool { draggedNoteIDs.count > 1 }
+    var draggedCount: Int { max(1, draggedNoteIDs.count) }
+    func isDragged(_ id: UUID) -> Bool { draggedNoteIDs.contains(id) }
+
+    /// The currently-active space the drag would drop into. Set by the active
+    /// column; when edge-switching changes the active space mid-drag this
+    /// becomes the *destination*, so a release commits a cross-space move.
+    @ObservationIgnored var dropSpace: Space?
+    /// The space the drag started in (to detect a cross-space drop).
+    @ObservationIgnored var sourceSpaceID: UUID?
+    /// Bottom space-chip frames in "notes-column" coords, for hit-testing a
+    /// note dragged over a chip (→ switch to that space).
+    @ObservationIgnored var spaceChipFrames: [UUID: CGRect] = [:]
+    /// Set by the editor pane while a single note is dragged over it: which
+    /// edge → on release `commitDrag` makes a split instead of a reorder.
+    @ObservationIgnored var editorDropSide: SplitDropSide?
+    /// Position of the grabbed (primary) row within the dragged group. The
+    /// floating stack and the list gap are anchored so this row lands under
+    /// the cursor — so a multi-drag feels like dragging that row alone.
+    var primaryGroupIndex: Int {
+        guard let id = draggedNoteID, let idx = draggedNoteIDs.firstIndex(of: id) else { return 0 }
+        return idx
+    }
+
     // Live cursor state
-    var cursorY: CGFloat? = nil
+    @ObservationIgnored var cursorY: CGFloat? = nil
+    @ObservationIgnored var cursorX: CGFloat? = nil
+    /// True while the drag cursor is inside the editor pane — drives the big
+    /// floating-tile ghost regardless of whether a split side has engaged
+    /// (middle = no split, but the tile still floats over the note).
+    var cursorOverEditor: Bool = false
+    /// Bumped each time a drag begins — lets the stuck-drag watchdog tell its
+    /// own drag apart from a fresh re-drag of the same note.
+    @ObservationIgnored var dragGeneration = 0
     var translation: CGSize = .zero
+
+    /// Set on drag release to lock the floating tile's width during the
+    /// snap. Without this, the data commit's `@Query` refresh updates
+    /// `noteCountsByTier` mid-snap and `ghostTileWidth` recomputes to a
+    /// stale count's width — the tile visibly resizes wide, then settles.
+    var frozenTileWidth: CGFloat? = nil
+
+    /// Set on a PROMOTE release to lock the Essentials grid's column
+    /// count to its post-commit value. The data commit's `@Query`
+    /// refresh lags `session.reset()`, so for a frame the grid would lay
+    /// out with the old (fewer) columns — wider cells — then snap
+    /// narrower. Held until `notes.count` catches up to the new count.
+    var frozenFavoriteColumnCount: Int? = nil
+
+    /// Set on release to lock the floating ghost's SHAPE (tile vs row)
+    /// during the snap. The ghost's shape is normally derived from
+    /// `currentTier ?? sourceTier`; if that momentarily resolves to a
+    /// non-favorite tier while the ghost is still on screen (which can
+    /// happen as the commit / reset settles), the ghost snaps to a
+    /// full-tier-width ROW for a frame — the "glitches wider" flash.
+    /// Freezing pins it to whatever it was at release.
+    var frozenAsTile: Bool? = nil
+
+    /// True for the duration of the release glide. Drives the floating
+    /// ghost's shadow easing down from its "picked up" lift (radius 8) to the
+    /// resting pill's shadow (radius 4) so the handoff to the real row has no
+    /// shadow step. Set inside the commit's `withAnimation`, cleared by `reset`.
+    var isSettling: Bool = false
 
     // Live target (where the row would land if released right now)
     var currentTier: NoteTier? = nil
     var currentIndex: Int = 0
 
     // Tier geometry / counts, populated by each MacSidebarGroup.
-    var tierFrames: [NoteTier: CGRect] = [:]
-    var noteCountsByTier: [NoteTier: Int] = [:]
+    @ObservationIgnored var tierFrames: [NoteTier: CGRect] = [:]
+    @ObservationIgnored var noteCountsByTier: [NoteTier: Int] = [:]
+    var favoriteDropZoneVisible: Bool = false
+    var showsAddToEssentialsBanner: Bool = false
 
     // Bottom edge of the active column's space-name label, in
     // "notes-column" coords. Used as the threshold for showing the
     // "Add to Essentials" banner — cursor must rise above it to trigger.
-    var spaceNameMaxY: CGFloat = 0
+    @ObservationIgnored var spaceNameMaxY: CGFloat = 0
+
+    // Grid layout constants for the Essentials section.
+    static let noteRowHeight: CGFloat = 35 // 32pt row + 3pt spacing
+    static let noteRowContentHeight: CGFloat = 32 // visible row (excludes the 3pt gap)
+    static let favoriteCellSpacing: CGFloat = 7
+    static let favoriteCellHeight: CGFloat = 82 // 66 minHeight + 16 padding
+
+    /// Dynamic column count for the Essentials grid — mirrors Zen's
+    /// behavior of letting tiles fill the available row width. 1 → 1 col
+    /// (100% wide), 2 → 2 cols (50% each), 3 → 3 cols (33% each), 4 →
+    /// 2x2 (50% each), 5+ → 3 per row.
+    static func favoriteColumnCount(for count: Int) -> Int {
+        switch count {
+        case 0, 1: return 1
+        case 2:    return 2
+        case 3:    return 3
+        case 4:    return 2
+        default:   return 3
+        }
+    }
+
+    /// Inner padding inside `MacEssentialsRow`'s grid (`.padding(2)` on
+    /// the LazyVGrid) — added to cell origin & subtracted from cell
+    /// width so the predicted snap target matches the actual rendered
+    /// tile position to the pixel.
+    static let favoriteGridPadding: CGFloat = 2
+
+    /// Width of a single Essentials grid cell, given the grid's full
+    /// width and the displayed tile count.
+    static func favoriteCellWidth(gridWidth: CGFloat, count: Int) -> CGFloat {
+        let n = favoriteColumnCount(for: count)
+        let contentWidth = gridWidth - 2 * favoriteGridPadding
+        return max(0, (contentWidth - CGFloat(n - 1) * favoriteCellSpacing) / CGFloat(n))
+    }
+
+    // Total vertical footprint of the Essentials section in the sidebar
+    // (the grid plus the surrounding paddings). When the last essential
+    // leaves, this is exactly the height the sidebar collapses by — we
+    // use it to pre-shift the ghost's drop target so the ghost slide
+    // and the sidebar's collapse can run in parallel.
+    @ObservationIgnored var essentialsSectionHeight: CGFloat = 0
 
     var isActive: Bool { draggedNoteID != nil }
 
@@ -963,12 +2585,86 @@ final class CrossTierDragSession {
         return s != c
     }
 
+    func syncFavoriteDropZone(favoriteCount: Int) {
+        noteCountsByTier[.favorite] = favoriteCount
+        refreshFavoriteDropZoneVisibility()
+    }
+
+    func setSpaceNameMaxY(_ maxY: CGFloat) {
+        guard abs(spaceNameMaxY - maxY) > 0.5 else { return }
+        spaceNameMaxY = maxY
+        refreshFavoriteDropZoneVisibility()
+    }
+
+    func updateDrag(location: CGPoint, translation newTranslation: CGSize, rowHeight: CGFloat) {
+        cursorY = location.y
+        cursorX = location.x
+        if translation != newTranslation {
+            translation = newTranslation
+        }
+        updateTarget(rowHeight: rowHeight)
+    }
+
+    func refreshFavoriteDropZoneVisibility() {
+        let hasFavorites = (noteCountsByTier[.favorite] ?? 0) > 0
+        let shouldShowBanner = shouldShowEmptyFavoriteBanner()
+        if showsAddToEssentialsBanner != shouldShowBanner {
+            showsAddToEssentialsBanner = shouldShowBanner
+        }
+
+        let shouldShowDropZone = hasFavorites || shouldShowBanner
+        if favoriteDropZoneVisible != shouldShowDropZone {
+            favoriteDropZoneVisible = shouldShowDropZone
+        }
+
+        if !shouldShowDropZone {
+            tierFrames[.favorite] = nil
+            if currentTier == .favorite, sourceTier != .favorite {
+                currentTier = sourceTier
+                currentIndex = sourceIndex
+            }
+        }
+    }
+
+    private func shouldShowEmptyFavoriteBanner() -> Bool {
+        guard isActive,
+              sourceTier != .favorite,
+              (noteCountsByTier[.favorite] ?? 0) == 0,
+              let cursorY else { return false }
+
+        let threshold: CGFloat
+        if spaceNameMaxY > 0 {
+            threshold = spaceNameMaxY
+        } else if let firstTierTop = [NoteTier.pinned, .random].compactMap({ tierFrames[$0]?.minY }).min(),
+                  firstTierTop > 0 {
+            threshold = firstTierTop
+        } else {
+            threshold = 120
+        }
+        return cursorY < threshold
+    }
+
     /// Recomputes `currentTier` and `currentIndex` from the live cursor.
     /// The actual sibling-row animation is provided by `.animation(value:)`
     /// on the consuming views — no `withAnimation` here would just double
     /// up and make things feel laggy.
     func updateTarget(rowHeight: CGFloat) {
         guard let y = cursorY else { return }
+        // While the cursor is over the editor (forming a split), the sidebar
+        // list must hold still — moving the ghost tile up/down shouldn't
+        // reshuffle the tabs. Park the target back at the source so the rows
+        // sit at rest until the cursor returns to the sidebar.
+        //
+        // Gate on `cursorOverEditor`, NOT just `editorDropSide != nil`: in the
+        // MIDDLE (no-split) zone the cursor is over the editor but no edge has
+        // engaged (`editorDropSide == nil`), and the old guard let the list
+        // reshuffle there.
+        if cursorOverEditor || editorDropSide != nil {
+            if currentTier != sourceTier { currentTier = sourceTier }
+            if currentIndex != sourceIndex { currentIndex = sourceIndex }
+            return
+        }
+        refreshFavoriteDropZoneVisibility()
 
         // Pick the tier whose frame is *closest* to the cursor — exact
         // containment first, otherwise minimum vertical distance. Avoids
@@ -978,6 +2674,7 @@ final class CrossTierDragSession {
         var bestTier: NoteTier? = nil
         var bestDistance: CGFloat = .greatestFiniteMagnitude
         for tier in [NoteTier.favorite, .pinned, .random] {
+            if tier == .favorite && !favoriteDropZoneVisible { continue }
             guard let frame = tierFrames[tier] else { continue }
             let distance: CGFloat
             if y >= frame.minY, y <= frame.maxY {
@@ -992,112 +2689,186 @@ final class CrossTierDragSession {
                 bestTier = tier
             }
         }
+        // Defensive: if the only matched tier is .favorite but the
+        // cursor is clearly below the essentials section, fall through
+        // to whichever row tier we know about (or .random as a default)
+        // so a demote drag still works even when row-tier frames haven't
+        // been pushed into the session yet.
+        if let bt = bestTier, bt == .favorite,
+           let favFrame = tierFrames[.favorite],
+           y > favFrame.maxY + 8 {
+            if tierFrames[.pinned] != nil {
+                bestTier = .pinned
+            } else if tierFrames[.random] != nil {
+                bestTier = .random
+            } else {
+                bestTier = .random
+            }
+        }
+
         let newTier = bestTier ?? sourceTier
         guard let target = newTier else { return }
 
         let frame = tierFrames[target] ?? .zero
-        let yInTier = max(0, y - frame.minY)
         let baseCount = noteCountsByTier[target] ?? 0
         let effective = target == sourceTier ? max(1, baseCount) : (baseCount + 1)
-        let raw = Int((yInTier / rowHeight).rounded(.down))
-        let newIndex = min(max(0, raw), max(0, effective - 1))
+
+        let newIndex: Int
+        if target == .favorite, frame.width > 0 {
+            // 2D grid hit-test against the current row-fill column count.
+            let pad = Self.favoriteGridPadding
+            let xInGrid = max(0, (cursorX ?? frame.midX) - frame.minX - pad)
+            let yInGrid = max(0, y - frame.minY - pad)
+            let N = Self.favoriteColumnCount(for: effective)
+            let cellW = Self.favoriteCellWidth(gridWidth: frame.width, count: effective)
+            let col = min(N - 1, max(0, Int(xInGrid / (cellW + Self.favoriteCellSpacing))))
+            let row = max(0, Int(yInGrid / (Self.favoriteCellHeight + Self.favoriteCellSpacing)))
+            let proposed = row * N + col
+            newIndex = min(max(0, proposed), max(0, effective - 1))
+        } else {
+            let yInTier = max(0, y - frame.minY)
+            let raw = Int((yInTier / rowHeight).rounded(.down))
+            newIndex = min(max(0, raw), max(0, effective - 1))
+        }
 
         if currentTier != target || currentIndex != newIndex {
+            let tierChanged = currentTier != target
             currentTier = target
             currentIndex = newIndex
+            // Trackpad detent each time the drop target moves during the drag
+            // (not the release snap). Row changes get a subtle tick; crossing
+            // into a new tier gets a heavier one to highlight the boundary.
+            playDragDetent(tierChanged: tierChanged)
+        }
+    }
+
+    /// Single-tick haptic for crossing into a new drop slot. `.levelChange` is
+    /// the FIRMEST of macOS's three patterns; `.alignment` the lightest — this
+    /// is the maximum contrast a single tick can have, since AppKit exposes no
+    /// haptic intensity (and Core Haptics doesn't drive the Mac trackpad). Fired
+    /// `.now` for immediacy. Only fires on capable trackpads with haptics on.
+    private func playDragDetent(tierChanged: Bool) {
+        #if canImport(AppKit)
+        let pattern: NSHapticFeedbackManager.FeedbackPattern = tierChanged ? .levelChange : .alignment
+        NSHapticFeedbackManager.defaultPerformer.perform(pattern, performanceTime: .now)
+        #endif
+    }
+
+    /// Safety net for the drag engine: each commit defers `reset()` inside a
+    /// `withAnimation { … } completion:` closure, and that completion can fail
+    /// to fire if the dragged row's identity changes mid-settle (e.g. a split
+    /// forms). The session would then stay `isActive` and jam every later drag.
+    /// A beat after release, if the SAME drag is still active, force-reset.
+    func scheduleWatchdog(for id: UUID?, generation: Int) {
+        guard let id else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self, self.draggedNoteID == id, self.dragGeneration == generation else { return }
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) { self.reset() }
         }
     }
 
     func reset() {
         draggedNoteID = nil
+        draggedNoteIDs = []
         sourceTier = nil
         sourceIndex = 0
         sourceRowCenter = .zero
         cursorY = nil
+        cursorX = nil
         translation = .zero
         currentTier = nil
         currentIndex = 0
+        frozenTileWidth = nil
+        frozenAsTile = nil
+        isSettling = false
+        sourceSpaceID = nil
+        editorDropSide = nil
+        cursorOverEditor = false
+        // dropSpace is left as-is (it tracks the active column, re-set on each
+        // active-space change); it's only consulted during a live drag.
+        // NOTE: frozenFavoriteColumnCount is intentionally NOT cleared
+        // here — it must survive `reset()` (which fires before @Query
+        // catches up) and is released by the notes.count onChange once
+        // the live layout matches. It's re-set fresh on each release.
+        refreshFavoriteDropZoneVisibility()
     }
 }
 
-/// Tier-filtered note arrays so the drag committer can rebuild any
-/// destination tier's ordering without re-filtering inside `MacSidebarGroup`.
-struct AllNotesByTier {
-    let favorite: [Note]
-    let pinned: [Note]
-    let random: [Note]
+/// Active-space header (Arc-style): `[icon] name … ⋯`. Hover reveals the ⋯
+/// menu; right-click opens the same menu. Rename is inline (header becomes a
+/// text field + Done). This is a presentation view — the editing STATE, the
+/// menu items, and the icon/theme popovers live in `MacSpaceNotesColumn` so
+/// the empty-sidebar right-click and the header share one source of truth.
+private struct MacSpaceHeaderView<MenuItems: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let space: Space
+    @Binding var isRenaming: Bool
+    @Binding var draftName: String
+    let onCommitRename: () -> Void
+    @ViewBuilder var menuItems: () -> MenuItems
 
-    func notes(for tier: NoteTier) -> [Note] {
-        switch tier {
-        case .favorite: return favorite
-        case .pinned: return pinned
-        case .random: return random
-        case .archived: return []
-        }
-    }
-}
+    @State private var isHovering = false
+    @FocusState private var renameFocused: Bool
 
-/// Shared cross-tier drag state. The dragged row's offset follows the cursor;
-/// every other row in any tier computes its own offset from the same formula
-/// (see `MacSidebarGroup.offset(forIndex:)`). Switching tiers happens by
-/// hit-testing the cursor against each tier's frame.
-struct NoteDragState: Equatable {
-    let noteID: UUID
-    let originalTier: NoteTier
-    let originalIndex: Int
-    var currentTier: NoteTier
-    var currentIndex: Int
-    var translation: CGSize
-    var pointer: CGPoint           // in "notes-column" coords
-    let startPointer: CGPoint
-    /// Offset from the cursor to the source row's center at the moment the
-    /// drag began. Used to anchor the floating overlay so it doesn't jump
-    /// to the cursor on the first frame.
-    let pointerDeltaFromRowCenter: CGSize
-}
+    var body: some View {
+        HStack(spacing: 8) {
+            MacSpaceIcon.view(space.emoji, size: 15)
+                .foregroundStyle(.primary.opacity(0.82))
 
-@Observable
-@MainActor
-final class NoteDragController {
-    var state: NoteDragState? = nil
-    var tierFrames: [NoteTier: CGRect] = [:]
-    var noteCountsByTier: [NoteTier: Int] = [:]
-
-    var isActive: Bool { state != nil }
-    var isCrossTier: Bool {
-        guard let s = state else { return false }
-        return s.currentTier != s.originalTier
-    }
-
-    /// Recomputes `currentTier` and `currentIndex` from the live pointer.
-    /// Wraps changes in a spring animation so sibling rows interpolate cleanly.
-    /// Promotion *into* `.favorite` is disallowed (context-menu only) — only
-    /// notes already in `.favorite` can target it.
-    func updateTarget(rowHeight: CGFloat) {
-        guard var s = state else { return }
-
-        var newTier = s.currentTier
-        for tier in [NoteTier.favorite, .pinned, .random] {
-            if tier == .favorite && s.originalTier != .favorite { continue }
-            if let frame = tierFrames[tier], frame.contains(s.pointer) {
-                newTier = tier
-                break
+            if isRenaming {
+                TextField("Space Name", text: $draftName)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .focused($renameFocused)
+                    .onSubmit(onCommitRename)
+                    .onChange(of: renameFocused) { _, focused in
+                        if !focused { onCommitRename() }
+                    }
+                Spacer(minLength: 0)
+                Button("Done", action: onCommitRename)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.6))
+            } else {
+                Text(space.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.82))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Menu {
+                    menuItems()
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary.opacity(0.6))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(.plain)
+                .fixedSize()
+                .opacity(isHovering ? 1 : 0)
             }
         }
-
-        let frame = tierFrames[newTier] ?? .zero
-        let yInTier = max(0, s.pointer.y - frame.minY)
-        let baseCount = noteCountsByTier[newTier] ?? 0
-        let effective = newTier == s.originalTier ? max(1, baseCount) : (baseCount + 1)
-        let raw = Int((yInTier / rowHeight).rounded(.down))
-        let newIndex = min(max(0, raw), max(0, effective - 1))
-
-        if s.currentTier != newTier || s.currentIndex != newIndex {
-            withAnimation(.spring(response: 0.26, dampingFraction: 0.85)) {
-                state?.currentTier = newTier
-                state?.currentIndex = newIndex
-            }
+        .padding(.horizontal, 8)
+        .frame(height: 30)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isHovering && !isRenaming
+                      ? Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06)
+                      : Color.clear)
         }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .contextMenu { if !isRenaming { menuItems() } }
+        .onChange(of: isRenaming) { _, now in
+            if now { renameFocused = true }
+        }
+        .animation(.easeOut(duration: 0.1), value: isHovering)
     }
 }
 
@@ -1109,14 +2880,34 @@ private struct MacSidebarGroup: View {
     let notes: [Note]
     let folders: [Folder]
     let selectedNoteID: UUID?
-    @Binding var dragTarget: NoteDropTarget?
-    @Binding var isDragging: Bool
     let selectNote: (Note) -> Void
     let tier: NoteTier
     let session: CrossTierDragSession
+    let selection: NoteSelectionModel
+    let performBatch: (NoteBatchAction) -> Void
+    let openInSplit: (Note) -> Void
+    let addToSplit: (Note) -> Void
+    var onSplitDrop: (Note, SplitDropSide) -> Void = { _, _ in }
+    /// Split pairs hosted by this space. Each pair carries the row ID that
+    /// renders its combined pill.
+    var splitPairs: [MacSidebarSplitPair] = []
+    var pendingSplitPrimaryID: UUID?
+    var dissolveSplit: (UUID, NoteTier, Space) -> Void = { _, _, _ in }
+    var cancelPendingSplit: () -> Void = { }
+    @Binding var renamingFolderID: UUID?
     var isActiveSpace: Bool = true
+    var columnWidth: CGFloat = 300
 
-    private let rowHeight: CGFloat = 35 // 32pt row + 3pt spacing
+    /// This tier's displayed note order — the ⇧-range domain handed to rows.
+    private var orderedNoteIDs: [UUID] { notes.map(\.id) }
+
+    private let rowHeight = CrossTierDragSession.noteRowHeight
+
+    // Latest measured frame for this group, in "notes-column" coords.
+    // Cached locally so we can push it into `session.tierFrames[tier]`
+    // when this column becomes the active one (even when its layout
+    // didn't change — e.g., the very first time it appears active).
+    @State private var lastMeasuredFrame: CGRect = .zero
 
     private var spaceColor: Color {
         Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
@@ -1128,30 +2919,82 @@ private struct MacSidebarGroup: View {
     var body: some View {
         LazyVStack(spacing: 3) {
             ForEach(folders) { folder in
-                MacFolderRow(folder: folder, space: space, selectedNoteID: selectedNoteID, selectNote: selectNote)
+                MacFolderRow(folder: folder, space: space, selectedNoteID: selectedNoteID, selectNote: selectNote, selection: selection, performBatch: performBatch, openInSplit: openInSplit, addToSplit: addToSplit, renamingFolderID: $renamingFolderID)
             }
 
             ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
-                let isSource = session.draggedNoteID == note.id && isSourceTier
+                // Multi-drag: every dragged row collapses out of flow wherever
+                // it lives. Single-drag: only the one grabbed row, and only
+                // when it has crossed into another tier.
+                let isSource = session.isMulti
+                    ? session.isDragged(note.id)
+                    : (session.draggedNoteID == note.id && isSourceTier)
+                let collapse = session.isMulti
+                    ? isSource
+                    : (isSource && session.isCrossTier)
 
-                MacNoteRow(
-                    note: note,
-                    space: space,
-                    isSelected: selectedNoteID == note.id,
-                    showDropIndicator: false,
-                    indicatorColor: spaceColor,
-                    selectNote: selectNote
-                )
+                Group {
+                    // The split primary's slot renders the combined pill (the
+                    // secondary is hidden from the list); it drags through the
+                    // same engine as a normal row.
+                    if let splitPair = splitPairs.first(where: { $0.anchorID == note.id }) {
+                        MacSplitTabRow(
+                            primary: splitPair.primary,
+                            secondary: splitPair.secondary,
+                            onSelect: { selectNote(splitPair.primary) },
+                            onSeparate: { dissolveSplit(splitPair.primary.id, tier, space) },
+                            isFocused: selectedNoteID == splitPair.primary.id
+                                || selectedNoteID == splitPair.secondary.id,
+                            tint: spaceColor
+                        )
+                    } else if note.id == pendingSplitPrimaryID {
+                        // Add-to-Split pending: pill with an empty second slot
+                        // until a note is picked or created.
+                        MacSplitTabRow(
+                            primary: note,
+                            secondary: nil,
+                            onSelect: { selectNote(note) },
+                            isFocused: true,
+                            onCancelPending: cancelPendingSplit,
+                            tint: spaceColor
+                        )
+                    } else {
+                        MacNoteRow(
+                            note: note,
+                            space: space,
+                            isSelected: selectedNoteID == note.id,
+                            showDropIndicator: false,
+                            indicatorColor: spaceColor,
+                            selectNote: selectNote,
+                            selection: selection,
+                            performBatch: performBatch,
+                            openInSplit: openInSplit,
+                            addToSplit: addToSplit,
+                            orderedIDs: orderedNoteIDs
+                        )
+                    }
+                }
+                // The host note keeps the same model ID while its row changes
+                // from single → pending → formed split. Give LazyVStack an
+                // explicit presentation identity so it replaces the row
+                // immediately instead of waiting for a later drag invalidation.
+                .id(tabPresentationID(for: note))
                 // Source row collapses out of layout when the cursor has
                 // moved into another tier (so this tier's rows close the
                 // gap). Within-tier, slot is preserved so the unified offset
                 // formula can shift siblings around it.
                 .opacity(isSource ? 0 : 1)
-                .frame(height: (isSource && session.isCrossTier) ? 0 : nil)
+                .frame(height: collapse ? 0 : nil)
                 .offset(y: offset(forIndex: index))
-                .gesture(liveDragGesture(for: note, at: index))
+                .simultaneousGesture(liveDragGesture(for: note, at: index))
             }
-            .animation(.spring(response: 0.18, dampingFraction: 0.82),
+            // Gate on `isActive`: during a drag this animates the live
+            // reshuffle, but `.animation(value:)` is transaction-independent
+            // and would re-fire when the session clears on release — animating
+            // the dragged row's opacity reveal as the ghost hands off (the
+            // subtle residual movement). With the param nil while inactive,
+            // the settle frame is instant.
+            .animation(session.isActive ? .smooth(duration: 0.14) : nil,
                        value: dragSignature)
 
             tierEndDropZone
@@ -1159,21 +3002,38 @@ private struct MacSidebarGroup: View {
         .onGeometryChange(for: CGRect.self) { proxy in
             proxy.frame(in: .named("notes-column"))
         } action: { newFrame in
+            // Cache the frame regardless of active state so we can push
+            // it later when this column becomes active.
+            lastMeasuredFrame = newFrame
             // Only the active (centered) column reports tier frames so
             // off-screen columns don't overwrite the live geometry.
             if isActiveSpace { session.tierFrames[tier] = newFrame }
         }
         .onAppear {
-            if isActiveSpace { session.noteCountsByTier[tier] = notes.count }
+            if isActiveSpace {
+                session.noteCountsByTier[tier] = notes.count
+                session.dropSpace = space
+                // If we already have a measured frame, push it now —
+                // covers the case where geometry was reported before
+                // `isActiveSpace` flipped true.
+                if lastMeasuredFrame.height > 0 {
+                    session.tierFrames[tier] = lastMeasuredFrame
+                }
+            }
         }
         .onChange(of: notes.count) { _, newValue in
             if isActiveSpace { session.noteCountsByTier[tier] = newValue }
         }
         .onChange(of: isActiveSpace) { _, newValue in
-            // When this column becomes the active one (after a swipe),
-            // refresh its frames and counts so the session is in sync.
+            // When this column becomes the active one (after a swipe, edge
+            // auto-switch, or the first time `selectedSpaceID` resolves),
+            // refresh its frames/counts and mark it as the live drop space.
             if newValue {
                 session.noteCountsByTier[tier] = notes.count
+                session.dropSpace = space
+                if lastMeasuredFrame.height > 0 {
+                    session.tierFrames[tier] = lastMeasuredFrame
+                }
             }
         }
     }
@@ -1184,6 +3044,16 @@ private struct MacSidebarGroup: View {
         let st = session.sourceTier?.rawValue ?? "_"
         let ct = session.currentTier?.rawValue ?? "_"
         return "\(st)|\(session.sourceIndex)|\(ct)|\(session.currentIndex)"
+    }
+
+    private func tabPresentationID(for note: Note) -> String {
+        if let splitPair = splitPairs.first(where: { $0.anchorID == note.id }) {
+            return "\(note.id.uuidString)|split|\(splitPair.primary.id.uuidString)|\(splitPair.secondary.id.uuidString)"
+        }
+        if note.id == pendingSplitPrimaryID {
+            return "\(note.id.uuidString)|pending"
+        }
+        return "\(note.id.uuidString)|single"
     }
 
     /// Unified vertical offset for the row at `index` in this tier.
@@ -1197,15 +3067,45 @@ private struct MacSidebarGroup: View {
     /// Destination tier (different from source): push every row at
     /// `currentIndex` or later down by `rowHeight` so the dragged row has a
     /// visible landing slot — identical to the within-tier gap.
+    private func tierRank(_ tier: NoteTier) -> Int {
+        switch tier {
+        case .pinned: return 0
+        case .random: return 1
+        case .favorite: return 2
+        case .archived: return 3
+        }
+    }
+
+    /// Multi-drag offset: dragged rows are collapsed (return 0); in the
+    /// destination tier, push the visible rows at/after the drop slot down by
+    /// the whole group's height so the N-row gap opens. Visible index is the
+    /// count of non-dragged rows before `i` (collapsed rows take no space, so
+    /// the cursor-derived `currentIndex` is already in visible terms).
+    private func multiOffset(forIndex i: Int) -> CGFloat {
+        if session.isDragged(notes[i].id) { return 0 }
+        guard isCurrentTier else { return 0 }
+        var visibleIndex = 0
+        for j in 0..<i where !session.isDragged(notes[j].id) { visibleIndex += 1 }
+        // Gap opens so the grabbed row lands at currentIndex (block top is
+        // currentIndex - primaryGroupIndex), matching the floating stack.
+        let gapStart = max(0, session.currentIndex - session.primaryGroupIndex)
+        return visibleIndex >= gapStart
+            ? CGFloat(session.draggedCount) * rowHeight
+            : 0
+    }
+
     private func offset(forIndex i: Int) -> CGFloat {
         guard session.isActive else { return 0 }
+        if session.isMulti { return multiOffset(forIndex: i) }
 
-        // After the data commit but before the session is wiped, the dragged
-        // note already lives in its destination tier's `notes` array at the
-        // exact slot the ghost finished animating to. Once that's the case,
-        // every offset should be 0 so nothing visually re-shuffles when the
-        // session finally resets.
-        if let id = session.draggedNoteID, notes.contains(where: { $0.id == id }), !isSourceTier {
+        // Post-commit short-circuit: the dragged note is now at its target
+        // slot in this tier's `notes` (true for within-tier reorder once
+        // the manualSortIndex update lands, and for cross-tier
+        // destinations once the tier change lands). Return 0 for every
+        // row so nothing visibly shifts before `session.reset()`.
+        if let id = session.draggedNoteID,
+           let idx = notes.firstIndex(where: { $0.id == id }),
+           idx == session.currentIndex {
             return 0
         }
 
@@ -1244,24 +3144,70 @@ private struct MacSidebarGroup: View {
         DragGesture(minimumDistance: 2, coordinateSpace: .named("notes-column"))
             .onChanged { value in
                 if session.draggedNoteID == nil {
+                    session.dragGeneration &+= 1
                     session.draggedNoteID = note.id
+                    // Multi-drag when the grabbed row is part of an active
+                    // multi-selection: drag the whole set in display order
+                    // (Pinned before Random, then manual order). Otherwise a
+                    // normal single drag.
+                    if selection.contains(note.id), selection.count > 1 {
+                        session.draggedNoteIDs = allNotes
+                            .filter { selection.contains($0.id) }
+                            .sorted { a, b in
+                                let ra = tierRank(a.tier), rb = tierRank(b.tier)
+                                return ra == rb ? noteSort(a, b) : ra < rb
+                            }
+                            .map(\.id)
+                    } else {
+                        session.draggedNoteIDs = [note.id]
+                    }
+                    session.sourceSpaceID = space.id
                     session.sourceTier = tier
                     session.sourceIndex = index
                     session.currentTier = tier
                     session.currentIndex = index
+                    // Compute the source row's natural center from this
+                    // tier's frame. If `.onGeometryChange` hasn't fired
+                    // yet (first drag after launch), `tierFrame` is
+                    // `.zero` — fall back to the cursor's start position
+                    // so the floating ghost still anchors near the row
+                    // instead of jumping to (0, 0).
                     let tierFrame = session.tierFrames[tier] ?? .zero
-                    session.sourceRowCenter = CGPoint(
-                        x: tierFrame.midX,
-                        y: tierFrame.minY + CGFloat(index) * rowHeight + rowHeight / 2
-                    )
+                    if tierFrame.height > 0 {
+                        session.sourceRowCenter = CGPoint(
+                            x: tierFrame.midX,
+                            // Center on the row's visible content (32pt), not
+                            // half the pitch (35pt) — the 3pt gap sits below
+                            // the row, so +17.5 lands 1.5pt low and shows as a
+                            // subtle snap on release.
+                            y: tierFrame.minY + CGFloat(index) * rowHeight
+                                + CrossTierDragSession.noteRowContentHeight / 2
+                        )
+                    } else {
+                        // First drag before `.onGeometryChange` has fired.
+                        // Use the active column's known midX so the ghost
+                        // is horizontally centered like a normal row,
+                        // regardless of where exactly the user clicked.
+                        session.sourceRowCenter = CGPoint(
+                            x: columnWidth / 2,
+                            y: value.startLocation.y
+                        )
+                    }
                     session.noteCountsByTier[tier] = notes.count
-                    isDragging = true
                 }
-                session.cursorY = value.location.y
-                session.translation = CGSize(width: 0, height: value.translation.height)
-                session.updateTarget(rowHeight: rowHeight)
+                // Track 2D translation. Row-mode rendering ignores
+                // `translation.width` (ghost anchored to row tier midX),
+                // but tile-mode rendering uses it so when a row drag
+                // enters Essentials and morphs to a tile, the tile
+                // follows the cursor horizontally.
+                session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
             }
-            .onEnded { _ in commitDrag() }
+            .onEnded { _ in
+                let stuckID = session.draggedNoteID
+                let gen = session.dragGeneration
+                commitDrag()
+                session.scheduleWatchdog(for: stuckID, generation: gen)
+            }
     }
 
     /// Unified release path: animate the floating ghost (via
@@ -1269,25 +3215,125 @@ private struct MacSidebarGroup: View {
     /// commit the data and clear the session non-animated. Identical for
     /// within-tier reorder and cross-tier promotion/demotion.
     private func commitDrag() {
+        if session.isMulti { commitMultiDrag(); return }
+
         guard let id = session.draggedNoteID,
-              let source = allNotes.first(where: { $0.id == id }),
-              let dest = session.currentTier else {
+              let source = allNotes.first(where: { $0.id == id }) else {
+            wipe()
+            return
+        }
+        // Released over the editor → make a split instead of a reorder.
+        if let side = session.editorDropSide {
+            onSplitDrop(source, side)
+            wipe()
+            return
+        }
+        guard let dest = session.currentTier else {
             wipe()
             return
         }
         let destIndex = session.currentIndex
         let crossTier = dest != session.sourceTier
+        // After an edge auto-switch the active (drop) space may differ from
+        // this column's space → commit a cross-space move into it.
+        let destSpace = session.dropSpace ?? space
 
         // Where on the column should the ghost end up?
         let destFrame = session.tierFrames[dest] ?? .zero
-        let targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight + rowHeight / 2
+        let targetCenterX: CGFloat
+        let targetCenterY: CGFloat
+        if dest == .favorite, destFrame.width > 0 {
+            // Promotion into Essentials — snap to the post-commit grid
+            // cell, not to a row slot. Without this the ghost lands on a
+            // y derived from `rowHeight`, then session.reset reveals the
+            // tile sitting at the correct cell — reading as a jump.
+            let pad = CrossTierDragSession.favoriteGridPadding
+            let spacing = CrossTierDragSession.favoriteCellSpacing
+            let cellH = CrossTierDragSession.favoriteCellHeight
+            let postCount = max(1, (session.noteCountsByTier[.favorite] ?? 0)
+                                + (crossTier ? 1 : 0))
+            let N = CrossTierDragSession.favoriteColumnCount(for: postCount)
+            let cellW = CrossTierDragSession.favoriteCellWidth(gridWidth: destFrame.width,
+                                                               count: postCount)
+            let col = destIndex % N
+            let row = destIndex / N
+            targetCenterX = destFrame.minX + pad + CGFloat(col) * (cellW + spacing) + cellW / 2
+            targetCenterY = destFrame.minY + pad + CGFloat(row) * (cellH + spacing) + cellH / 2
+
+            // CRITICAL for promotes: this row-drag path (not commitTileDrag)
+            // is what runs when a note is dragged up from another section.
+            // Lock the grid's column count, the ghost's tile shape, and the
+            // ghost width to their post-commit values so the @Query refresh
+            // (which lands mid-snap and changes the favorite count) can't
+            // briefly relayout the grid to a wider, fewer-column state —
+            // the "glitches wider, then settles" you saw on promote only.
+            session.frozenFavoriteColumnCount = N
+            session.frozenAsTile = true
+            session.frozenTileWidth = cellW - 16
+        } else {
+            targetCenterX = destFrame.midX
+            // Match the source-center convention: land on the row's visible
+            // content center so the ghost arrives exactly where the real row
+            // will appear (no 1.5pt second snap).
+            targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight
+                + CrossTierDragSession.noteRowContentHeight / 2
+            session.frozenAsTile = false
+        }
+        let targetTranslationX = targetCenterX - session.sourceRowCenter.x
         let targetTranslationY = targetCenterY - session.sourceRowCenter.y
 
-        withAnimation(.spring(response: 0.16, dampingFraction: 0.88)) {
-            session.translation = CGSize(width: 0, height: targetTranslationY)
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(
+                width: dest == .favorite ? targetTranslationX : 0,
+                height: targetTranslationY
+            )
         } completion: {
-            withAnimation(.spring(response: 0.18, dampingFraction: 0.82)) {
-                performMove(source: source, dest: dest, destIndex: destIndex, crossTier: crossTier)
+            // Commit data without an animation context. Pre-shaped layout
+            // (collapsed source row + tier-end expansion/contraction) means
+            // pre/post-commit visual positions match — animating would
+            // produce an unwanted "settle" on every release.
+            //
+            // The Essentials section's grow/shrink is still animated
+            // separately via the EssentialsLayoutKey spring on the outer
+            // VStack, which observes the favorite count change.
+            // `destIndex` came from `currentIndex`, which is computed against the
+            // VISIBLE row list (this tier's `notes`, already filtered by hidden
+            // split secondary + search). `performMove` inserts into the FULL
+            // tier list. If a hidden note sits before the drop spot, the two
+            // index spaces diverge → ghost glides to the visual slot, but the
+            // commit lands the row elsewhere → "snaps right then teleports."
+            // For within-tier reorder, translate to a full-list index using the
+            // visible note that should sit JUST BEFORE source after the move.
+            let adjustedDestIndex: Int
+            if !crossTier && source.space?.id == destSpace.id {
+                let visibleWithoutSource = notes.filter { $0.id != source.id }
+                if destIndex <= 0 || visibleWithoutSource.isEmpty {
+                    adjustedDestIndex = 0
+                } else if destIndex >= visibleWithoutSource.count {
+                    let fullCount = allNotes.filter {
+                        $0.tier == dest && $0.space?.id == destSpace.id && $0.folder == nil && $0.id != source.id
+                    }.count
+                    adjustedDestIndex = fullCount
+                } else {
+                    let anchorID = visibleWithoutSource[destIndex - 1].id
+                    let fullTier = allNotes
+                        .filter { $0.tier == dest && $0.space?.id == destSpace.id && $0.folder == nil && $0.id != source.id }
+                        .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+                    adjustedDestIndex = (fullTier.firstIndex { $0.id == anchorID } ?? -1) + 1
+                }
+            } else {
+                adjustedDestIndex = destIndex
+            }
+            performMove(source: source, dest: dest, destIndex: adjustedDestIndex, crossTier: crossTier, destSpace: destSpace)
+            // Dragging the split tab moves the pair: place the secondary right
+            // after the primary in its new tier/space, keeping the split.
+            // EXCEPT into Essentials — favorites are single tiles, so dragging
+            // the secondary along would spawn a stray second tile. Only the
+            // primary becomes essential (the split breaks).
+            if let splitPair = splitPairs.first(where: { $0.primary.id == source.id }),
+               dest != .favorite {
+                placeSplitSecondaryAfterPrimary(splitPair)
             }
             DispatchQueue.main.async {
                 var tx = Transaction()
@@ -1295,37 +3341,155 @@ private struct MacSidebarGroup: View {
                 withTransaction(tx) {
                     session.reset()
                 }
-                isDragging = false
             }
         }
     }
 
-    private func performMove(source: Note, dest: NoteTier, destIndex: Int, crossTier: Bool) {
-        if crossTier {
+    /// Keep the split pair together after the primary is dragged: move the
+    /// secondary into the primary's (possibly new) tier/space, right after it.
+    private func placeSplitSecondaryAfterPrimary(_ splitPair: MacSidebarSplitPair) {
+        let primary = splitPair.primary
+        let secondary = splitPair.secondary
+        let pid = primary.id
+        let sid = secondary.id
+        secondary.tier = primary.tier
+        secondary.space = primary.space
+        secondary.folder = nil
+        let tier = primary.tier
+        let spaceID = primary.space?.id
+        var list = allNotes
+            .filter { $0.tier == tier && $0.space?.id == spaceID && $0.folder == nil && $0.id != sid }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        if let pidx = list.firstIndex(where: { $0.id == pid }) {
+            list.insert(secondary, at: pidx + 1)
+        } else {
+            list.append(secondary)
+        }
+        for (i, n) in list.enumerated() { n.manualSortIndex = i }
+        try? modelContext.save()
+    }
+
+    /// `destSpace` is the space to land in — normally this column's `space`,
+    /// but after an edge auto-switch it's the now-active space (a cross-space
+    /// move). Favorites are global so `destSpace` is ignored there.
+    private func performMove(source: Note, dest: NoteTier, destIndex: Int, crossTier: Bool, destSpace: Space) {
+        let crossSpace = dest != .favorite && source.space?.id != destSpace.id
+        if crossTier || crossSpace {
             source.tier = dest
-            source.space = dest == .favorite ? nil : space
+            source.space = dest == .favorite ? nil : destSpace
             source.folder = nil
         }
 
-        // Rebuild destination tier
+        // Rebuild destination tier (in destSpace).
         let destOthers: [Note] = dest == .favorite
             ? allNotes.filter { $0.tier == .favorite && $0.id != source.id }
-            : allNotes.filter { $0.tier == dest && $0.space?.id == space.id && $0.folder == nil && $0.id != source.id }
+            : allNotes.filter { $0.tier == dest && $0.space?.id == destSpace.id && $0.folder == nil && $0.id != source.id }
         var destReordered = destOthers.sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
         let insertIdx = min(destIndex, destReordered.count)
         destReordered.insert(source, at: insertIdx)
         for (i, n) in destReordered.enumerated() { n.manualSortIndex = i }
 
-        // If we left a different tier, renumber its remaining notes too.
-        if crossTier, let srcTier = session.sourceTier {
+        // Renumber the tier the note left (its original space + tier).
+        if crossTier || crossSpace, let srcTier = session.sourceTier {
+            let srcSpaceID = session.sourceSpaceID ?? space.id
             let srcOthers: [Note] = srcTier == .favorite
                 ? allNotes.filter { $0.tier == .favorite && $0.id != source.id }
-                : allNotes.filter { $0.tier == srcTier && $0.space?.id == space.id && $0.folder == nil && $0.id != source.id }
+                : allNotes.filter { $0.tier == srcTier && $0.space?.id == srcSpaceID && $0.folder == nil && $0.id != source.id }
             let srcSorted = srcOthers.sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
             for (i, n) in srcSorted.enumerated() { n.manualSortIndex = i }
         }
 
         source.updatedAt = Date()
+        try? modelContext.save()
+    }
+
+    /// Release path for a multi-drag. Springs the floating stack so the grabbed
+    /// (primary) row lands in its reserved gap slot — when you've dragged the
+    /// stack far past the drop point, this is the satisfying snap back to where
+    /// it belongs — then commits the data and clears the session in a deferred,
+    /// non-animated transaction (resetting inside the animation would make the
+    /// ghost fly to zero). The deferral lets `@Query` refresh first so the real
+    /// rows are already in place when the ghost is removed (clean handoff).
+    private func commitMultiDrag() {
+        guard let dest = session.currentTier else { wipe(); return }
+        let ids = session.draggedNoteIDs
+        // Promote the whole group INTO Essentials (a grid, not rows) — commit at
+        // the grid hit-test index and let the grid reflow in (no row-glide math).
+        if dest == .favorite {
+            performMoveMulti(ids: ids, dest: .favorite, destIndex: session.currentIndex)
+            wipe()
+            return
+        }
+        // Block lands so the grabbed row sits at currentIndex (see multiOffset).
+        let rawDestIndex = max(0, session.currentIndex - session.primaryGroupIndex)
+
+        // Clamp the insert to the count of VISIBLE (non-dragged) rows in the
+        // destination — `currentIndex` is bounded by the full row count, which
+        // includes the collapsed dragged rows, so an unclamped target sits too
+        // low and the glide visibly stops short before the rows appear higher.
+        let destVisibleCount = allNotes.filter {
+            $0.tier == dest && $0.space?.id == space.id && $0.folder == nil && !session.isDragged($0.id)
+        }.count
+        let destIndex = min(rawDestIndex, destVisibleCount)
+
+        // Where the grabbed row's center ends up: its slot within the open gap.
+        let destFrame = session.tierFrames[dest] ?? .zero
+        let primaryLandedSlot = destIndex + session.primaryGroupIndex
+        let primaryTargetCenterY = destFrame.minY
+            + CGFloat(primaryLandedSlot) * rowHeight
+            + CrossTierDragSession.noteRowContentHeight / 2
+        let targetTranslationY = primaryTargetCenterY - session.sourceRowCenter.y
+
+        // Same glide as single-drag (no spring overshoot/settle, which read as
+        // jitter here) so the stack snaps cleanly to its slot. Commit + reset
+        // happen synchronously the instant the glide lands — deferring the
+        // reset to a later runloop made the ghost sit at the target for a
+        // frame or more (waiting on the @Query refresh of N notes) before the
+        // real rows appeared, which read as a "stop" at the end of the snap.
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(width: 0, height: targetTranslationY)
+        } completion: {
+            performMoveMulti(ids: ids, dest: dest, destIndex: destIndex)
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) {
+                session.reset()
+            }
+        }
+    }
+
+    /// Move the whole dragged set to `dest` at `destIndex`, preserving the
+    /// group's relative order, and renumber any source tiers they left.
+    private func performMoveMulti(ids: [UUID], dest: NoteTier, destIndex: Int) {
+        let movers = ids.compactMap { id in allNotes.first { $0.id == id } }
+        guard !movers.isEmpty else { return }
+        for m in movers {
+            m.tier = dest
+            m.space = dest == .favorite ? nil : space   // favorites are global
+            m.folder = nil
+        }
+
+        // Rebuild the destination tier with the group inserted as a block.
+        // (Favorites are global → match on tier alone, ignore space.)
+        let destOthers = allNotes
+            .filter { $0.tier == dest && (dest == .favorite || $0.space?.id == space.id) && $0.folder == nil && !ids.contains($0.id) }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        var reordered = destOthers
+        let insertIdx = min(max(0, destIndex), reordered.count)
+        reordered.insert(contentsOf: movers, at: insertIdx)
+        for (i, n) in reordered.enumerated() { n.manualSortIndex = i }
+
+        // Renumber the tiers the group left behind (incl. favorites).
+        for srcTier in [NoteTier.pinned, .random, .favorite] where srcTier != dest {
+            let remaining = allNotes
+                .filter { $0.tier == srcTier && (srcTier == .favorite || $0.space?.id == space.id) && $0.folder == nil && !ids.contains($0.id) }
+                .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+            for (i, n) in remaining.enumerated() { n.manualSortIndex = i }
+        }
+
+        let now = Date()
+        for m in movers { m.updatedAt = now }
         try? modelContext.save()
     }
 
@@ -1335,7 +3499,6 @@ private struct MacSidebarGroup: View {
         withTransaction(tx) {
             session.reset()
         }
-        isDragging = false
     }
 
     /// While this tier is a cross-tier destination AND the source row is
@@ -1344,6 +3507,13 @@ private struct MacSidebarGroup: View {
     /// row). Once the row is committed (notes contains it), the expansion
     /// collapses to 0 since the real row now occupies that slot.
     private var tierEndExpansion: CGFloat {
+        // Multi-drag: the destination tier reserves the whole group's height
+        // for the N-row gap (favorites isn't a multi-drop target). Collapses
+        // to 0 on commit+reset (isActive flips false), animating the gap shut.
+        if session.isMulti {
+            guard session.isActive, isCurrentTier, session.currentTier != .favorite else { return 0 }
+            return CGFloat(session.draggedCount) * rowHeight
+        }
         guard session.isActive, isCurrentTier, session.isCrossTier else { return 0 }
         if let id = session.draggedNoteID, notes.contains(where: { $0.id == id }) {
             return 0
@@ -1366,111 +3536,209 @@ private struct MacSidebarGroup: View {
 
     @ViewBuilder
     private var tierEndDropZone: some View {
-        let isTarget = dragTarget == NoteDropTarget(tier: tier, anchor: .tierEnd(tier))
         Color.clear
             .frame(height: max(0, 16 + tierEndExpansion - tierEndContraction))
-            .animation(.spring(response: 0.18, dampingFraction: 0.82), value: tierEndExpansion)
-            .animation(.spring(response: 0.18, dampingFraction: 0.82), value: tierEndContraction)
-            .overlay(alignment: .top) {
-                if isTarget {
-                    Capsule()
-                        .fill(spaceColor.opacity(0.85))
-                        .frame(height: 2)
-                        .padding(.horizontal, 6)
-                }
-            }
-            .contentShape(Rectangle())
-            .dropDestination(for: DraggedItemTransfer.self) { items, _ in
-                handleDrop(items: items, before: nil)
-                return true
-            } isTargeted: { targeted in
-                if targeted {
-                    dragTarget = NoteDropTarget(tier: tier, anchor: .tierEnd(tier))
-                } else if dragTarget == NoteDropTarget(tier: tier, anchor: .tierEnd(tier)) {
-                    dragTarget = nil
-                }
-            }
-    }
-
-    /// Cross-tier-aware drop handler. If `before` is nil, append to tier.
-    private func handleDrop(items: [DraggedItemTransfer], before destination: Note?) {
-        defer { dragTarget = nil }
-        guard let item = items.first, item.kind == .note else { return }
-        guard let source = allNotes.first(where: { $0.id == item.id }) else { return }
-        guard source.id != destination?.id else { return }
-
-        // Update tier / space / folder so the move sticks across sections.
-        source.tier = tier
-        if tier == .favorite {
-            // Favorites are global — clear the space.
-            source.space = nil
-        } else {
-            source.space = space
-        }
-        source.folder = nil
-
-        // Rebuild the tier's ordered list (excluding the dragged note), then
-        // insert at the target position; re-number manualSortIndex.
-        var reordered = notes.filter { $0.id != source.id }
-        if let destination, let destIdx = reordered.firstIndex(where: { $0.id == destination.id }) {
-            reordered.insert(source, at: destIdx)
-        } else {
-            reordered.append(source)
-        }
-        for (idx, n) in reordered.enumerated() { n.manualSortIndex = idx }
-        source.updatedAt = Date()
-        try? modelContext.save()
+            // Gated on `isActive` so the spacer collapses instantly on release
+            // (the transaction-independent animation would otherwise slide the
+            // rows below it shut over 0.14s — residual movement after the drop).
+            .animation(session.isActive ? .smooth(duration: 0.14) : nil, value: tierEndExpansion)
+            .animation(session.isActive ? .smooth(duration: 0.14) : nil, value: tierEndContraction)
     }
 }
 
 private struct MacFolderRow: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.colorScheme) private var colorScheme
     let folder: Folder
     let space: Space
     let selectedNoteID: UUID?
     let selectNote: (Note) -> Void
+    let selection: NoteSelectionModel
+    let performBatch: (NoteBatchAction) -> Void
+    let openInSplit: (Note) -> Void
+    let addToSplit: (Note) -> Void
+    @Binding var renamingFolderID: UUID?
+    var depth: Int = 0
 
-    @State private var isExpanded = true
+    @State private var isHovering = false
+    @State private var draftName = ""
+    @FocusState private var renameFocused: Bool
+
+    private let indentStep: CGFloat = 14
+
+    private var isExpanded: Bool { !folder.isCollapsed }
+    private var isRenaming: Bool { renamingFolderID == folder.id }
+    private var canAddSubfolder: Bool { folder.depth < Folder.maxDepth }
+
+    private var childFolders: [Folder] {
+        (folder.children ?? []).sorted {
+            $0.sortIndex == $1.sortIndex ? $0.createdAt < $1.createdAt : $0.sortIndex < $1.sortIndex
+        }
+    }
 
     private var notes: [Note] {
         (folder.notes ?? []).sorted(by: noteSort)
     }
 
+    private var totalCount: Int { notes.count + childFolders.count }
+
     var body: some View {
         VStack(spacing: 2) {
-            Button {
-                withAnimation(.smooth(duration: 0.16)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: isExpanded ? "folder.fill" : "folder")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 22)
-                        .foregroundStyle(.secondary)
-
-                    Text(folder.name)
-                        .font(.system(size: 13, weight: .medium))
-                        .lineLimit(1)
-
-                    Spacer(minLength: 0)
-
-                    Text("\(notes.count)")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 8)
-                .frame(height: 32)
-                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            }
-            .buttonStyle(.plain)
+            header
 
             if isExpanded {
+                // Nested folders first, then loose notes — matches Zen's
+                // folder-over-tab ordering within a disclosure group.
+                ForEach(childFolders) { child in
+                    MacFolderRow(
+                        folder: child,
+                        space: space,
+                        selectedNoteID: selectedNoteID,
+                        selectNote: selectNote,
+                        selection: selection,
+                        performBatch: performBatch,
+                        openInSplit: openInSplit,
+                        addToSplit: addToSplit,
+                        renamingFolderID: $renamingFolderID,
+                        depth: depth + 1
+                    )
+                }
+
                 ForEach(notes) { note in
-                    MacNoteRow(note: note, space: space, isSelected: selectedNoteID == note.id, selectNote: selectNote)
-                        .padding(.leading, 18)
+                    MacNoteRow(
+                        note: note,
+                        space: space,
+                        isSelected: selectedNoteID == note.id,
+                        selectNote: selectNote,
+                        selection: selection,
+                        performBatch: performBatch,
+                        openInSplit: openInSplit,
+                        addToSplit: addToSplit,
+                        orderedIDs: notes.map(\.id)
+                    )
+                    .padding(.leading, CGFloat(depth) * indentStep + 18)
                 }
             }
         }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isExpanded ? "folder.fill" : "folder")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 22)
+                .foregroundStyle(.secondary)
+
+            if isRenaming {
+                TextField("Folder name", text: $draftName)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .focused($renameFocused)
+                    .onSubmit(commitRename)
+                    .onChange(of: renameFocused) { _, focused in
+                        if !focused { commitRename() }
+                    }
+            } else {
+                Text(folder.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+
+            if !isRenaming {
+                Text("\(totalCount)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 32)
+        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .background {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isHovering && !isRenaming
+                      ? Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.07)
+                      : Color.clear)
+        }
+        .padding(.leading, CGFloat(depth) * indentStep)
+        .onTapGesture { if !isRenaming { toggleExpanded() } }
+        .onHover { isHovering = $0 }
+        .contextMenu { menu }
+        .onChange(of: isRenaming) { _, now in
+            if now { draftName = folder.name; renameFocused = true }
+        }
+        .onAppear {
+            if isRenaming { draftName = folder.name; renameFocused = true }
+        }
+    }
+
+    @ViewBuilder
+    private var menu: some View {
+        if canAddSubfolder {
+            Button("New Subfolder", systemImage: "folder.badge.plus") { addSubfolder() }
+        }
+        Button("Rename", systemImage: "pencil") { renamingFolderID = folder.id }
+        moveMenu
+        Divider()
+        Button("Delete Folder", systemImage: "trash", role: .destructive) { deleteFolder() }
+    }
+
+    @ViewBuilder
+    private var moveMenu: some View {
+        let targets = moveTargets
+        if !targets.isEmpty || folder.parent != nil {
+            Menu("Move to") {
+                if folder.parent != nil {
+                    Button("Top Level", systemImage: "arrow.up.to.line") { reparent(nil) }
+                }
+                ForEach(targets) { target in
+                    Button(target.name, systemImage: "folder") { reparent(target) }
+                }
+            }
+        }
+    }
+
+    /// Folders in the same space + tier that this folder could legally nest
+    /// under (no cycles, within the depth cap).
+    private var moveTargets: [Folder] {
+        let service = FolderService(context: modelContext)
+        let spaceID = space.id
+        let descriptor = FetchDescriptor<Folder>(predicate: #Predicate { $0.space?.id == spaceID })
+        let all = (try? modelContext.fetch(descriptor)) ?? []
+        return all
+            .filter { $0.tier == folder.tier
+                && $0.id != folder.id
+                && $0.id != folder.parent?.id
+                && service.canNest(folder, under: $0) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func toggleExpanded() {
+        withAnimation(.smooth(duration: 0.16)) {
+            try? FolderService(context: modelContext).setCollapsed(folder, !folder.isCollapsed)
+        }
+    }
+
+    private func addSubfolder() {
+        let service = FolderService(context: modelContext)
+        guard let child = try? service.create(in: space, tier: folder.tier, parent: folder) else { return }
+        try? service.setCollapsed(folder, false) // reveal the new child
+        renamingFolderID = child.id
+    }
+
+    private func reparent(_ parent: Folder?) {
+        try? FolderService(context: modelContext).reparent(folder, under: parent)
+    }
+
+    private func deleteFolder() {
+        try? FolderService(context: modelContext).delete(folder)
+    }
+
+    private func commitRename() {
+        guard isRenaming else { return }
+        try? FolderService(context: modelContext).rename(folder, to: draftName)
+        renamingFolderID = nil
     }
 }
 
@@ -1479,59 +3747,108 @@ private struct MacNoteRow: View {
     @Environment(\.colorScheme) private var colorScheme
     let note: Note
     let space: Space
+    /// Whether this is the active space's *open* note (shown in the editor).
     let isSelected: Bool
     var showDropIndicator: Bool = false
     var indicatorColor: Color = .accentColor
     let selectNote: (Note) -> Void
+    /// Shared multi-select set (⌘/⇧-click). The row both reads it (highlight,
+    /// menu mode) and mutates it (toggle/range on modified clicks).
+    var selection: NoteSelectionModel
+    /// Apply a batch action over the whole selection (menu only).
+    var performBatch: (NoteBatchAction) -> Void = { _ in }
+    /// Open this note beside the currently-open one (editor split).
+    var openInSplit: (Note) -> Void = { _ in }
+    /// Add an empty note beside this one (when it's the open note).
+    var addToSplit: (Note) -> Void = { _ in }
+    /// This tier's displayed note order — the domain for ⇧-range selection.
+    var orderedIDs: [UUID] = []
 
     @State private var isHovering = false
+    @State private var isHoveringDelete = false
 
     private var spaceColor: Color {
         Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
     }
 
+    /// Highlighted when it's a member of an active multi-selection, or — when
+    /// nothing is multi-selected — when it's the open note.
+    private var isHighlighted: Bool {
+        selection.isActive ? selection.contains(note.id) : isSelected
+    }
+
+    /// Elevated, space-tinted fill for the selected pill (lifts off the bg).
+    private var selectionFill: Color { spaceColor.elevatedSelectionFill(scheme: colorScheme) }
+
+    /// Readable ink chosen from the *pill* color, so text/glyphs stay legible
+    /// whatever the elevated fill resolves to (light pill → dark ink, lifted
+    /// dark pill → light ink).
+    private var selectionInk: Color { selectionFill.selectionInk }
+
+    /// The × glyph color — brightens when hovering the button itself.
+    private var deleteInk: Color {
+        if isHighlighted { return selectionInk.opacity(isHoveringDelete ? 1 : 0.7) }
+        return Color.primary.opacity(isHoveringDelete ? 0.9 : 0.5)
+    }
+    /// Circular highlight behind the × on direct hover.
+    private var deleteHoverFill: Color {
+        guard isHoveringDelete else { return .clear }
+        return isHighlighted ? selectionInk.opacity(0.18) : Color.primary.opacity(0.12)
+    }
+
     var body: some View {
         HStack(spacing: 9) {
-            MacNoteMiniIcon(note: note, size: 20, tintedWhite: isSelected)
-
             Text(note.title)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .font(.system(size: 13, weight: isHighlighted ? .semibold : .medium))
                 .lineLimit(1)
 
             Spacer(minLength: 0)
 
-            if isHovering {
-                Button(action: deleteNote) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 18, height: 18)
-                        .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.primary.opacity(0.5))
-                }
-                .buttonStyle(.plain)
-                .help("Delete note")
+            Button(action: deleteNote) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(deleteInk)
+                    .frame(width: 18, height: 18)
+                    .background {
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(deleteHoverFill)
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
             }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                if isHoveringDelete != hovering { isHoveringDelete = hovering }
+            }
+            .help("Delete note")
+            .opacity(isHovering ? 1 : 0)
+            .scaleEffect(isHovering ? 1 : 0.92)
+            .allowsHitTesting(isHovering)
+            .accessibilityHidden(!isHovering)
+            .animation(.easeOut(duration: 0.1), value: isHoveringDelete)
         }
-        .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(0.86))
-        .padding(.horizontal, 9)
+        .foregroundStyle(isHighlighted ? selectionInk : Color.primary.opacity(0.86))
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
         .frame(height: 32)
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            // Soft shadow lives on the pill shape (not the row) so only the
+            // selected card casts it — the lift that reads as "modern". The
+            // shape is drawn over a faint hairline so the light pill keeps a
+            // crisp edge where the shadow is too subtle to define it.
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(rowBackground)
-        }
-        .overlay {
-            // A 1pt rim on the selected row gives the colored pill some
-            // definition against the sidebar tint — without leaning on the
-            // old left-edge capsule.
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(
-                    isSelected ? Color.white.opacity(0.18) : .clear,
-                    lineWidth: 1
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(
+                            isHighlighted ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05) : .clear,
+                            lineWidth: 0.5
+                        )
+                }
+                .shadow(
+                    color: isHighlighted ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear,
+                    radius: isHighlighted ? 4 : 0, x: 0, y: isHighlighted ? 1.5 : 0
                 )
         }
-        .shadow(
-            color: isSelected ? spaceColor.opacity(0.32) : .clear,
-            radius: isSelected ? 6 : 0, x: 0, y: 2
-        )
         .overlay(alignment: .top) {
             if showDropIndicator {
                 Capsule()
@@ -1542,29 +3859,95 @@ private struct MacNoteRow: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { selectNote(note) }
-        .onHover { isHovering = $0 }
-        .contextMenu {
-            Button("Open", systemImage: "doc.text") { selectNote(note) }
-            Divider()
-            Button("Make Essential", systemImage: "star.fill") { promote(to: .favorite) }
-            Button("Pin", systemImage: "pin.fill") { promote(to: .pinned) }
-            Button("Move to Notes", systemImage: "tray") { promote(to: .random) }
-            Divider()
-            Button("Duplicate", systemImage: "plus.square.on.square") { duplicateNote() }
-            Button("Archive", systemImage: "archivebox") { archiveNote() }
-            Button("Delete", systemImage: "trash", role: .destructive) { deleteNote() }
+        .simultaneousGesture(pressSelectionGesture)
+        .onHover { hovering in
+            if isHovering != hovering { isHovering = hovering }
         }
+        .contextMenu {
+            if selection.count > 1 && selection.contains(note.id) {
+                batchMenu
+            } else {
+                singleMenu
+            }
+        }
+        .animation(.easeOut(duration: 0.08), value: isHovering)
+        .animation(.easeOut(duration: 0.06), value: isHighlighted)
+    }
+
+    @ViewBuilder
+    private var singleMenu: some View {
+        Button("Open", systemImage: "doc.text") { selectNote(note) }
+        if isSelected {
+            // This is the open note → add an empty pane beside it.
+            Button("Add to Split View", systemImage: "rectangle.split.2x1") { addToSplit(note) }
+        } else {
+            Button("Open in Split View", systemImage: "rectangle.split.2x1") { openInSplit(note) }
+        }
+        Divider()
+        Button("Make Essential", systemImage: "star.fill") { promote(to: .favorite) }
+        Button("Pin", systemImage: "pin.fill") { promote(to: .pinned) }
+        Button("Move to Notes", systemImage: "tray") { promote(to: .random) }
+        Divider()
+        Button("Duplicate", systemImage: "plus.square.on.square") { duplicateNote() }
+        Button("Archive", systemImage: "archivebox") { archiveNote() }
+        Button("Delete", systemImage: "trash", role: .destructive) { deleteNote() }
+    }
+
+    @ViewBuilder
+    private var batchMenu: some View {
+        let n = selection.count
+        if n == 2 {
+            Button("Open in Split View", systemImage: "rectangle.split.2x1") { performBatch(.openSplit) }
+            Divider()
+        }
+        Button("Make \(n) Essential", systemImage: "star.fill") { performBatch(.makeEssential) }
+        Button("Pin \(n) Notes", systemImage: "pin.fill") { performBatch(.pin) }
+        Button("Move \(n) to Notes", systemImage: "tray") { performBatch(.moveToNotes) }
+        Divider()
+        Button("Duplicate \(n) Notes", systemImage: "plus.square.on.square") { performBatch(.duplicate) }
+        Button("Archive \(n) Notes", systemImage: "archivebox") { performBatch(.archive) }
+        Button("Delete \(n) Notes", systemImage: "trash", role: .destructive) { performBatch(.delete) }
     }
 
     private var rowBackground: Color {
-        if isSelected {
-            // Slightly deeper than before so the white text reads well and
-            // the row reads as a solid, cohesive pill (no accent capsule
-            // needed for affordance).
-            return spaceColor.opacity(colorScheme == .dark ? 0.95 : 0.92)
+        if isHighlighted {
+            // Elevated tinted pill: lighter than the space-tinted bg so it
+            // lifts off the surface (Arc-style), with a hint of the space hue.
+            return selectionFill
         }
         return isHovering ? Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.07) : Color.clear
+    }
+
+    private var pressSelectionGesture: some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .onEnded { value in
+                let moved = hypot(value.translation.width, value.translation.height) > 4
+                // A press that became a drag NEVER selects/opens the note — the
+                // drag owns the interaction. This is what lets you drag a tab
+                // onto the open note to split: the currently-open note must
+                // stay primary, so the dragged note must not steal selection on
+                // press. Only a true click (release without movement) selects.
+                guard !moved else { return }
+                handleClick()
+            }
+    }
+
+    /// Modifier-aware click: ⌘ toggles membership, ⇧ selects a range, plain
+    /// opens the note (clearing any selection upstream). Reads live keyboard
+    /// flags so it composes with the existing press/drag gestures.
+    private func handleClick() {
+        #if canImport(AppKit)
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            selection.toggle(note.id)
+            return
+        }
+        if flags.contains(.shift) {
+            selection.selectRange(to: note.id, in: orderedIDs)
+            return
+        }
+        #endif
+        selectNote(note)
     }
 
     private func promote(to tier: NoteTier) {
@@ -1589,15 +3972,17 @@ private struct MacNoteRow: View {
 private struct MacNoteMiniIcon: View {
     let note: Note
     let size: CGFloat
-    var tintedWhite: Bool = false
+    /// When set, the glyph sits on a selected pill — tile + letter adopt this
+    /// readable ink. `nil` = the default unselected (neutral) treatment.
+    var ink: Color? = nil
 
     var body: some View {
         RoundedRectangle(cornerRadius: 5, style: .continuous)
-            .fill(tintedWhite ? Color.white.opacity(0.22) : Color.primary.opacity(0.10))
+            .fill(ink.map { $0.opacity(0.22) } ?? Color.primary.opacity(0.10))
             .overlay {
                 Text(String(note.title.trimmingCharacters(in: .whitespacesAndNewlines).first ?? "N"))
                     .font(.system(size: size * 0.48, weight: .bold))
-                    .foregroundStyle(tintedWhite ? Color.white : Color.secondary)
+                    .foregroundStyle(ink ?? Color.secondary)
             }
             .frame(width: size, height: size)
     }
@@ -1613,6 +3998,689 @@ private func noteSort(_ lhs: Note, _ rhs: Note) -> Bool {
         return false
     case (.none, .none):
         return lhs.createdAt < rhs.createdAt
+    }
+}
+
+// MARK: - Manage Spaces board (Arc-style overview)
+
+/// Full-window overview of every space as a themed column, reorderable by
+/// dragging. Mirrors Arc's "Manage Spaces" board. Columns are a fixed width,
+/// so reorder uses a constant pitch (simpler than the bottom strip). Per-column
+/// ⋯ offers Open / Delete; editing (rename/theme/icon) stays in the sidebar.
+/// Column reorder handle with the shared soft-grey hover chip. Its own struct
+/// so each column tracks hover independently (a single `@State` on the parent
+/// would light every handle at once). The whole column owns the drag gesture;
+/// this is purely the visual affordance, and the hover tracking view sits in
+/// the background so it never swallows the drag.
+private struct ColumnDragHandle: View {
+    /// True while any column reorder drag is in flight. During a drag the
+    /// tracking area never gets a `mouseExited` (the drag captures the mouse),
+    /// so `isHovered` would stay stale-true after release — clear it here.
+    var isDragging: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
+
+    var body: some View {
+        Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.primary.opacity(isHovered ? 0.85 : 0.5))
+            .frame(width: 26, height: 26)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(.primary.opacity(
+                        isHovered ? (colorScheme == .dark ? 0.20 : 0.16) : 0.0
+                    ))
+            )
+            .contentShape(Rectangle())
+            .help("Drag the column to reorder")
+            .onHoverTracked {
+                if isHovered != $0 { isHovered = $0 }
+                // Open/grab hand — the standard cursor for a drag affordance
+                // (vs. the pointing finger used for buttons like the ⋯ menu).
+                OverlayCursor.shared.desired = $0 ? .openHand : .arrow
+            }
+            .onChange(of: isDragging) { _, dragging in
+                if dragging {
+                    isHovered = false
+                    OverlayCursor.shared.desired = .arrow
+                }
+            }
+            .animation(.easeOut(duration: 0.10), value: isHovered)
+    }
+}
+
+/// The "⋯" column menu glyph, with the shared soft-grey hover chip (cursor
+/// stays the default arrow). Own struct so each column tracks hover
+/// independently (mirrors [ColumnDragHandle]).
+private struct ColumnMenuGlyph: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
+
+    var body: some View {
+        Image(systemName: "ellipsis")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.primary.opacity(isHovered ? 0.85 : 0.55))
+            .frame(width: 26, height: 26)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(.primary.opacity(
+                        isHovered ? (colorScheme == .dark ? 0.20 : 0.16) : 0.0
+                    ))
+            )
+            .contentShape(Rectangle())
+            .onHoverTracked {
+                if isHovered != $0 { isHovered = $0 }
+                // Keep the plain arrow over the menu (no pointing hand), but
+                // assert it so the pump steadily overwrites any I-beam the
+                // editor / Menu control tries to set — otherwise it flickers.
+                OverlayCursor.shared.desired = .arrow
+            }
+            .animation(.easeOut(duration: 0.10), value: isHovered)
+    }
+}
+
+struct MacManageSpacesView: View {
+    let spaces: [Space]
+    let activeSpaceID: UUID?
+    let notesProvider: (Space) -> [Note]
+    let onClose: () -> Void
+    let onOpenSpace: (Space) -> Void
+    let requestDeleteSpace: (Space) -> Void
+
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.colorScheme) private var colorScheme
+
+    // Column (space) reorder — driven by the bottom-left handle only, so it
+    // never clashes with note dragging inside a column.
+    @State private var draggingSpaceID: UUID?
+    @State private var spaceSourceIndex = 0
+    @State private var spaceCurrentIndex = 0
+    @State private var spaceDragX: CGFloat = 0
+
+    // Note reorder, scoped to a single column + tier section.
+    @State private var draggingNoteID: UUID?
+    @State private var noteDragSpaceID: UUID?
+    @State private var noteDragTier: NoteTier?
+    @State private var noteSourceIndex = 0
+    @State private var noteCurrentIndex = 0   // within-tier reorder slot
+    @State private var noteCrossIndex = 0     // insert slot when over the other tier
+    @State private var noteDragY: CGFloat = 0
+    /// The tier section the cursor is currently over. When it differs from the
+    /// dragged note's own tier, the note will move into it (live gap + release).
+    @State private var noteHoverTier: NoteTier?
+    /// Section frames in the board coordinate space, keyed "spaceID|tier",
+    /// used to hit-test which section the cursor is over during a note drag.
+    @State private var sectionFrames: [String: CGRect] = [:]
+    /// The note being dragged + its floating ghost position (board coords).
+    /// The real row is hidden while this floats — same as the sidebar.
+    @State private var draggedNote: Note?
+    @State private var noteGhostPoint: CGPoint = .zero
+
+    /// ⌘/⇧ multi-select set for batch actions (shared model with the sidebar).
+    @State private var selection = NoteSelectionModel()
+    /// Guards the single-fire of the modified-click on a press.
+    @State private var selectPressHandled = false
+
+    private let boardSpace = "manage-board"
+
+    /// The space whose column the cursor is over (may differ from the source —
+    /// that's a cross-space move).
+    @State private var noteHoverSpaceID: UUID?
+
+    /// True when the cursor is still over the dragged note's own section. When
+    /// false the note is heading to a different tier and/or space, so the
+    /// source row collapses and the target section reserves a gap.
+    private var isSameSection: Bool {
+        noteHoverSpaceID == noteDragSpaceID && noteHoverTier == noteDragTier
+    }
+
+    private let columnWidth: CGFloat = 248
+    private let columnGap: CGFloat = 18
+    private var spacePitch: CGFloat { columnWidth + columnGap }
+    private let noteRowHeight: CGFloat = 30
+    private let noteSpacing: CGFloat = 2
+    private var notePitch: CGFloat { noteRowHeight + noteSpacing }
+
+    private var activeSpaceColor: Color {
+        let s = spaces.first { $0.id == activeSpaceID } ?? spaces.first
+        guard let s else { return .gray }
+        return Color.spaceColor(lightHex: s.colorHex, darkHex: s.darkColorHex, scheme: colorScheme)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            GeometryReader { geo in
+                // Shorter columns with generous top + bottom margins so the
+                // board breathes: pushed down from the header and lifted off
+                // the window's bottom edge (top 18 + bottom 72 = 90).
+                let columnHeight = max(340, geo.size.height - 90)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: columnGap) {
+                        ForEach(Array(spaces.enumerated()), id: \.element.id) { index, space in
+                            column(space, index: index, height: columnHeight)
+                                .frame(width: columnWidth)
+                                .offset(x: spaceOffset(index: index, id: space.id))
+                                .zIndex(draggingSpaceID == space.id ? 2 : 0)
+                                .opacity(draggingSpaceID == space.id ? 0.95 : 1)
+                                // Whole column drags to reorder spaces. Note rows
+                                // use a high-priority gesture so dragging a row
+                                // reorders the note instead of the column.
+                                .gesture(spaceReorderGesture(space: space, index: index))
+                        }
+                    }
+                    .padding(.horizontal, 28)
+                    .padding(.top, 18)
+                    .padding(.bottom, 72)
+                    .frame(minHeight: geo.size.height, alignment: .top)
+                }
+            }
+        }
+        .onExitCommand(perform: onClose)
+        .overlay {
+            // Floating ghost of the dragged note (the real row is hidden),
+            // mirroring the sidebar's drag model.
+            if let note = draggedNote {
+                ManageBoardNoteRow(note: note, height: noteRowHeight, isDragging: true)
+                    .frame(width: ghostWidth)
+                    .background(.white.opacity(colorScheme == .dark ? 0.12 : 0.55),
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .shadow(color: .black.opacity(0.22), radius: 8, x: 0, y: 4)
+                    .position(noteGhostPoint)
+                    .allowsHitTesting(false)
+            }
+        }
+        .coordinateSpace(name: boardSpace)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Forcibly own the cursor across the whole board so the note editor /
+        // sidebar BEHIND this full-window overlay can't leak their I-beam /
+        // resize cursors through the board's empty regions. The pump re-applies
+        // OverlayCursor.desired on every move (async, so it wins over whatever
+        // the covered content sets) and blocks click-through; the handle / ⋯
+        // set .desired = .pointingHand on hover.
+        .background(CursorPump())
+        .background {
+            ZStack {
+                Rectangle().fill(Color(nsColor: .windowBackgroundColor))
+                Rectangle().fill(activeSpaceColor.opacity(colorScheme == .dark ? 0.55 : 0.42))
+            }
+            .ignoresSafeArea()
+        }
+        .ignoresSafeArea()
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Keep the window's traffic lights in their usual spot at the very
+            // top-left (they were missing in this full-window overlay).
+            HStack(spacing: 0) {
+                EmbeddedTrafficLights()
+                    .frame(width: 76, height: 22)
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 18)
+
+            // Title row: a back chevron to the title's left (the × was removed
+            // as redundant with it). Back button shares the New Note button's
+            // hover treatment — grey chip + 1.03 lift — via SoftHoverIconButton.
+            // Leading aligns with the column grid (28) so the title block and
+            // first column share a left edge.
+            HStack(alignment: .center, spacing: 10) {
+                SoftHoverIconButton(systemName: "chevron.left", diameter: 30, iconSize: 15,
+                                    hoverScale: 1.08, help: "Back", action: onClose)
+                Text("Manage Spaces")
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .allowsHitTesting(false)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 28)
+            .padding(.trailing, 18)
+            .padding(.top, 20)
+            .padding(.bottom, 18)
+        }
+    }
+
+    private func column(_ space: Space, index: Int, height: CGFloat) -> some View {
+        let color = Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
+        let pinned = tierNotes(space, tier: .pinned)
+        let random = tierNotes(space, tier: .random)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                MacSpaceIcon.view(space.emoji, size: 15)
+                Text(space.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .allowsHitTesting(false)
+                Spacer(minLength: 0)
+                if space.id == activeSpaceID {
+                    Circle().fill(.primary.opacity(0.4)).frame(width: 6, height: 6)
+                }
+            }
+            .foregroundStyle(.primary.opacity(0.88))
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 8)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 6) {
+                    // Both sections always render (even empty) so each stays a
+                    // drop target for promote/demote, mirroring the sidebar.
+                    noteSection(space, tier: .pinned, notes: pinned)
+                    Rectangle()
+                        .fill(.primary.opacity(0.12))
+                        .frame(height: 1)
+                        .padding(.horizontal, 14)
+                    noteSection(space, tier: .random, notes: random)
+                }
+                .padding(.vertical, 6)
+                // Clear the floating controls so the last note never sits under
+                // the handle / menu.
+                .padding(.bottom, 32)
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .frame(height: height)
+        .background(color, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        // No separate footer bar: a soft fade dissolves a long list into the
+        // column color, with the move handle + menu floating at the corners.
+        .overlay(alignment: .bottom) {
+            LinearGradient(
+                stops: [
+                    .init(color: color.opacity(0), location: 0),
+                    .init(color: color, location: 0.7)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: 52)
+            .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottomLeading) {
+            columnHandle.padding(.leading, 12).padding(.bottom, 9)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            columnMenu(space).padding(.trailing, 12).padding(.bottom, 9)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.white.opacity(colorScheme == .dark ? 0.06 : 0.25), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.4 : 0.14),
+                radius: draggingSpaceID == space.id ? 18 : 8, x: 0, y: draggingSpaceID == space.id ? 10 : 4)
+    }
+
+    @ViewBuilder
+    private func noteMenu(_ note: Note, space: Space) -> some View {
+        if selection.count > 1, selection.contains(note.id) {
+            let n = selection.count
+            Button("Make \(n) Essential", systemImage: "star.fill") { batch(space) { promote($0, to: .favorite, space: space) } }
+            Button("Pin \(n) Notes", systemImage: "pin.fill") { batch(space) { promote($0, to: .pinned, space: space) } }
+            Button("Move \(n) to Notes", systemImage: "tray") { batch(space) { promote($0, to: .random, space: space) } }
+            Divider()
+            Button("Delete \(n) Notes", systemImage: "trash", role: .destructive) {
+                batch(space) { try? NoteService(context: modelContext).delete($0) }
+            }
+        } else {
+            Button("Open", systemImage: "doc.text") { onOpenSpace(space) }
+            Divider()
+            Button("Make Essential", systemImage: "star.fill") { promote(note, to: .favorite, space: space) }
+            Button("Pin", systemImage: "pin.fill") { promote(note, to: .pinned, space: space) }
+            Button("Move to Notes", systemImage: "tray") { promote(note, to: .random, space: space) }
+            Divider()
+            Button("Duplicate", systemImage: "plus.square.on.square") { _ = try? NoteService(context: modelContext).duplicate(note) }
+            Button("Archive", systemImage: "archivebox") { try? NoteService(context: modelContext).archive(note) }
+            Button("Delete", systemImage: "trash", role: .destructive) { try? NoteService(context: modelContext).delete(note) }
+        }
+    }
+
+    private func promote(_ note: Note, to tier: NoteTier, space: Space) {
+        try? NoteService(context: modelContext).promote(note, to: tier, currentSpace: space)
+    }
+
+    /// Apply an action to every selected note in this space, then clear.
+    private func batch(_ space: Space, _ action: (Note) -> Void) {
+        for note in notesProvider(space).filter({ selection.contains($0.id) }) { action(note) }
+        selection.clear()
+    }
+
+    /// ⌘-click toggles a row, ⇧-click selects a range, plain click (no drag)
+    /// clears. Reads live modifier flags so it composes with the reorder drag.
+    private func selectionGesture(note: Note, orderedIDs: [UUID]) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .onChanged { _ in
+                guard !selectPressHandled else { return }
+                selectPressHandled = true
+                #if canImport(AppKit)
+                let flags = NSEvent.modifierFlags
+                if flags.contains(.command) { selection.toggle(note.id) }
+                else if flags.contains(.shift) { selection.selectRange(to: note.id, in: orderedIDs) }
+                #endif
+            }
+            .onEnded { value in
+                let moved = hypot(value.translation.width, value.translation.height) > 4
+                #if canImport(AppKit)
+                let flags = NSEvent.modifierFlags
+                let modified = flags.contains(.command) || flags.contains(.shift)
+                if !moved, !modified { selection.clear() }
+                #endif
+                selectPressHandled = false
+            }
+    }
+
+    /// Decorative drag affordance (the whole column is the reorder drag target).
+    private var columnHandle: some View {
+        ColumnDragHandle(isDragging: draggingSpaceID != nil)
+    }
+
+    private func columnMenu(_ space: Space) -> some View {
+        Menu {
+            Button("Open Space", systemImage: "arrow.right.circle") { onOpenSpace(space) }
+            if spaces.count > 1 {
+                Divider()
+                Button("Delete Space", systemImage: "trash", role: .destructive) { requestDeleteSpace(space) }
+            }
+        } label: {
+            ColumnMenuGlyph()
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .fixedSize()
+    }
+
+    // MARK: - Space (column) reorder — fixed pitch
+
+    private func spaceOffset(index: Int, id: UUID) -> CGFloat {
+        guard draggingSpaceID != nil else { return 0 }
+        if id == draggingSpaceID { return spaceDragX }
+        let s = spaceSourceIndex, c = spaceCurrentIndex
+        if c > s, index > s, index <= c { return -spacePitch }
+        if c < s, index >= c, index < s { return spacePitch }
+        return 0
+    }
+
+    private func spaceReorderGesture(space: Space, index: Int) -> some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { value in
+                guard spaces.count > 1 else { return }
+                if draggingSpaceID == nil {
+                    draggingSpaceID = space.id
+                    spaceSourceIndex = index
+                    spaceCurrentIndex = index
+                }
+                spaceDragX = value.translation.width
+                let shift = Int((spaceDragX / spacePitch).rounded())
+                let clamped = min(max(0, spaceSourceIndex + shift), spaces.count - 1)
+                if clamped != spaceCurrentIndex {
+                    withAnimation(.smooth(duration: 0.18)) { spaceCurrentIndex = clamped }
+                }
+            }
+            .onEnded { _ in
+                // Glide the column to its target slot, then commit — so a column
+                // dragged far past its landing spot snaps cleanly into place.
+                let target = CGFloat(spaceCurrentIndex - spaceSourceIndex) * spacePitch
+                withAnimation(.smooth(duration: 0.18)) {
+                    spaceDragX = target
+                } completion: {
+                    commitSpaceReorder()
+                }
+            }
+    }
+
+    private func commitSpaceReorder() {
+        if draggingSpaceID != nil, spaces.indices.contains(spaceSourceIndex) {
+            var ids = spaces.map(\.id)
+            let moved = ids.remove(at: spaceSourceIndex)
+            ids.insert(moved, at: min(spaceCurrentIndex, ids.count))
+            for (i, sid) in ids.enumerated() {
+                spaces.first(where: { $0.id == sid })?.sortIndex = i
+            }
+            try? modelContext.save()
+        }
+        draggingSpaceID = nil
+        spaceDragX = 0
+    }
+
+    // MARK: - Tier sections + note reorder within a column
+
+    /// Notes of one tier (Pinned or Random) for a space, preserving the order
+    /// from `notesProvider` (which is already manual-sorted).
+    private func tierNotes(_ space: Space, tier: NoteTier) -> [Note] {
+        notesProvider(space).filter { $0.tier == tier }
+    }
+
+    private func noteSection(_ space: Space, tier: NoteTier, notes: [Note]) -> some View {
+        VStack(alignment: .leading, spacing: noteSpacing) {
+            ForEach(Array(notes.enumerated()), id: \.element.id) { i, note in
+                let isSource = draggingNoteID == note.id
+                ManageBoardNoteRow(note: note, height: noteRowHeight,
+                                   isDragging: false, isSelected: selection.contains(note.id))
+                    // Hidden while dragging (the ghost shows it). Collapsed to 0
+                    // height once it's heading to a different section (other
+                    // tier and/or other space's column) so the source shrinks
+                    // and the separator slides — like the sidebar.
+                    .opacity(isSource ? 0 : 1)
+                    .frame(height: (isSource && !isSameSection) ? 0 : noteRowHeight)
+                    .clipped()
+                    .offset(y: noteOffset(spaceID: space.id, tier: tier, index: i, id: note.id))
+                    .contextMenu { noteMenu(note, space: space) }
+                    .highPriorityGesture(noteReorderGesture(note: note, space: space, tier: tier, index: i, count: notes.count))
+                    .simultaneousGesture(selectionGesture(note: note, orderedIDs: notes.map(\.id)))
+            }
+            // Real gap height reserved in the tier the cursor is hovering (when
+            // it differs from the note's own tier) so that section actually
+            // grows — this is what makes the separator move (sidebar parity).
+            Color.clear.frame(height: trailingGap(space: space, tier: tier))
+        }
+        .frame(maxWidth: .infinity, minHeight: notes.isEmpty ? 30 : nil, alignment: .top)
+        .padding(.horizontal, 8)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(boardSpace))
+        } action: { sectionFrames["\(space.id.uuidString)|\(tier.rawValue)"] = $0 }
+    }
+
+    /// Visual gap: rows shift to open the landing slot. Within the source
+    /// section it shifts the rows between source and target; for any other
+    /// section (other tier and/or other space) it pushes the hovered section's
+    /// rows down from the insert slot. (The dragged row is hidden — the ghost
+    /// carries it.)
+    private func noteOffset(spaceID: UUID, tier: NoteTier, index: Int, id: UUID) -> CGFloat {
+        guard draggingNoteID != nil, id != draggingNoteID else { return 0 }
+        if isSameSection {
+            guard spaceID == noteDragSpaceID, tier == noteDragTier else { return 0 }
+            let s = noteSourceIndex, c = noteCurrentIndex
+            if c > s, index > s, index <= c { return -notePitch }
+            if c < s, index >= c, index < s { return notePitch }
+            return 0
+        } else {
+            if spaceID == noteHoverSpaceID, tier == noteHoverTier {
+                return index >= noteCrossIndex ? notePitch : 0
+            }
+            return 0
+        }
+    }
+
+    /// Real height reserved at the hovered target section (when it differs from
+    /// the source) so it grows and the separator moves — sidebar parity.
+    private func trailingGap(space: Space, tier: NoteTier) -> CGFloat {
+        guard draggingNoteID != nil, !isSameSection else { return 0 }
+        return (space.id == noteHoverSpaceID && tier == noteHoverTier) ? notePitch : 0
+    }
+
+    /// The space + tier section under a board-space point: nearest column by X,
+    /// then tier by Y. Enables dragging a note into another space's column.
+    private func hoverTarget(at point: CGPoint) -> (UUID, NoteTier)? {
+        var bestSpace: UUID?
+        var bestDx = CGFloat.greatestFiniteMagnitude
+        for s in spaces {
+            let f = sectionFrames["\(s.id.uuidString)|\(NoteTier.pinned.rawValue)"]
+                ?? sectionFrames["\(s.id.uuidString)|\(NoteTier.random.rawValue)"]
+            guard let f else { continue }
+            let dx = point.x < f.minX ? f.minX - point.x : (point.x > f.maxX ? point.x - f.maxX : 0)
+            if dx < bestDx { bestDx = dx; bestSpace = s.id }
+        }
+        guard let sid = bestSpace else { return nil }
+        let pinnedKey = "\(sid.uuidString)|\(NoteTier.pinned.rawValue)"
+        let tier: NoteTier = (sectionFrames[pinnedKey].map { point.y <= $0.maxY } ?? false) ? .pinned : .random
+        return (sid, tier)
+    }
+
+    private func noteReorderGesture(note: Note, space: Space, tier: NoteTier, index: Int, count: Int) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named(boardSpace))
+            .onChanged { value in
+                if draggingNoteID == nil {
+                    draggingNoteID = note.id
+                    draggedNote = note
+                    noteDragSpaceID = space.id
+                    noteHoverSpaceID = space.id
+                    noteDragTier = tier
+                    noteHoverTier = tier
+                    noteSourceIndex = index
+                    noteCurrentIndex = index
+                    noteCrossIndex = index
+                }
+                noteDragY = value.translation.height
+                noteGhostPoint = value.location   // ghost tracks the cursor
+
+                if let (hSpace, hTier) = hoverTarget(at: value.location),
+                   hSpace != noteHoverSpaceID || hTier != noteHoverTier {
+                    withAnimation(.smooth(duration: 0.18)) {
+                        noteHoverSpaceID = hSpace
+                        noteHoverTier = hTier
+                    }
+                }
+
+                if isSameSection {
+                    if count > 1 {
+                        let shift = Int((noteDragY / notePitch).rounded())
+                        let clamped = min(max(0, noteSourceIndex + shift), count - 1)
+                        if clamped != noteCurrentIndex {
+                            withAnimation(.smooth(duration: 0.18)) { noteCurrentIndex = clamped }
+                        }
+                    }
+                } else if let hsid = noteHoverSpaceID, let hTier = noteHoverTier,
+                          let hSpace = spaces.first(where: { $0.id == hsid }) {
+                    let frame = sectionFrames["\(hsid.uuidString)|\(hTier.rawValue)"] ?? .zero
+                    let localY = value.location.y - frame.minY
+                    let raw = Int((localY / notePitch).rounded(.down))
+                    let cnt = tierNotes(hSpace, tier: hTier).count
+                    let clamped = min(max(0, raw), cnt)
+                    if clamped != noteCrossIndex {
+                        withAnimation(.smooth(duration: 0.18)) { noteCrossIndex = clamped }
+                    }
+                }
+            }
+            .onEnded { _ in commitNoteDrag(note: note, sourceSpace: space) }
+    }
+
+    private func commitNoteDrag(note: Note, sourceSpace: Space) {
+        guard let dragTier = noteDragTier else { clearNoteDrag(); return }
+        let same = isSameSection
+        let targetTier = noteHoverTier ?? dragTier
+        let targetSpaceID = noteHoverSpaceID ?? sourceSpace.id
+        let targetIndex = same ? noteCurrentIndex : noteCrossIndex
+
+        // Glide the ghost into the open gap (in whatever column/tier), commit.
+        let tgtFrame = sectionFrames["\(targetSpaceID.uuidString)|\(targetTier.rawValue)"] ?? .zero
+        let targetPoint = CGPoint(
+            x: tgtFrame.midX,
+            y: tgtFrame.minY + CGFloat(targetIndex) * notePitch + noteRowHeight / 2
+        )
+
+        withAnimation(.smooth(duration: 0.18)) {
+            noteGhostPoint = targetPoint
+        } completion: {
+            if same {
+                commitNoteReorder(space: sourceSpace, tier: dragTier)
+            } else if let target = spaces.first(where: { $0.id == targetSpaceID }) {
+                commitMove(note: note, from: sourceSpace, fromTier: dragTier,
+                           to: target, tier: targetTier, at: targetIndex)
+            }
+            clearNoteDrag()
+        }
+    }
+
+    /// Reorders one tier's notes and writes sequential `manualSortIndex`.
+    private func commitNoteReorder(space: Space, tier: NoteTier) {
+        var arr = tierNotes(space, tier: tier)
+        guard arr.indices.contains(noteSourceIndex) else { return }
+        let moved = arr.remove(at: noteSourceIndex)
+        arr.insert(moved, at: min(noteCurrentIndex, arr.count))
+        for (i, n) in arr.enumerated() { n.manualSortIndex = i }
+        try? modelContext.save()
+    }
+
+    /// Moves a note to another tier and/or space at a specific slot, reindexing
+    /// both the destination tier and the tier it left.
+    private func commitMove(note: Note, from sourceSpace: Space, fromTier: NoteTier,
+                            to targetSpace: Space, tier: NoteTier, at index: Int) {
+        // Destination peers captured before mutating the note.
+        let destOthers = notesProvider(targetSpace).filter { $0.tier == tier && $0.id != note.id }
+        note.tier = tier
+        note.space = targetSpace
+        note.folder = nil
+        var dest = destOthers
+        dest.insert(note, at: min(max(0, index), dest.count))
+        for (i, n) in dest.enumerated() { n.manualSortIndex = i }
+        // Reindex the tier it left (it's gone from there now).
+        let src = notesProvider(sourceSpace).filter { $0.tier == fromTier && $0.id != note.id }
+        for (i, n) in src.enumerated() { n.manualSortIndex = i }
+        try? modelContext.save()
+    }
+
+    private func clearNoteDrag() {
+        draggingNoteID = nil
+        draggedNote = nil
+        noteDragSpaceID = nil
+        noteHoverSpaceID = nil
+        noteDragTier = nil
+        noteHoverTier = nil
+        noteDragY = 0
+    }
+
+    private var ghostWidth: CGFloat { columnWidth - 24 }
+}
+
+/// One note row in the Manage Spaces board — icon + title with a hover tint.
+private struct ManageBoardNoteRow: View {
+    let note: Note
+    let height: CGFloat
+    let isDragging: Bool
+    var isSelected: Bool = false
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 9) {
+            MacNoteMiniIcon(note: note, size: 18)
+            Text(note.title)
+                .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(.primary.opacity(0.85))
+                .lineLimit(1)
+                // Display-only — stop SwiftUI's selectable-Text I-beam cursor
+                // (the row itself owns hover/click via its contentShape).
+                .allowsHitTesting(false)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: height)
+        .background(
+            rowFill,
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(.white.opacity(0.5), lineWidth: 1)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+    }
+
+    private var rowFill: Color {
+        if isSelected { return .white.opacity(0.4) }
+        if isHovering || isDragging { return .white.opacity(0.22) }
+        return .clear
     }
 }
 #endif
