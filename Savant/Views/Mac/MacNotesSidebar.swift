@@ -452,6 +452,8 @@ struct MacNotesSidebar: View {
                         if let pid = pendingSplitPrimaryID { ids.insert(pid) }
                         return ids
                     }(),
+                    activeSplits: activeSplits,
+                    dissolveSplit: dissolveSplit,
                     onSplitDrop: onSplitDrop,
                     selection: selection,
                     performBatch: performBatch,
@@ -736,10 +738,17 @@ private struct MacSidebarFloatingGhost: View {
             if overEditor {
                 editorTileGhost
             } else if let pair = splitPair {
-                MacSplitTabRow(primary: pair.0, secondary: pair.1,
-                               showsSeparateIndicator: true,
-                               isFocused: true, tint: spaceColor ?? .accentColor)
-                    .frame(width: rowWidth)
+                // A split dragged FROM Essentials morphs with the drop target:
+                // the combined tile while over the grid, the row pill once it
+                // crosses into a list tier (mirrors a single tile's morph).
+                if asTile && session.sourceTier == .favorite {
+                    splitTileGhost(primary: pair.0, secondary: pair.1)
+                } else {
+                    MacSplitTabRow(primary: pair.0, secondary: pair.1,
+                                   showsSeparateIndicator: true,
+                                   isFocused: true, tint: spaceColor ?? .accentColor)
+                        .frame(width: rowWidth)
+                }
             } else if let pending = pendingPrimary {
                 // Dragging the pending pick-mode pill: ghost mirrors the combined
                 // primary + "choose a note" placeholder (matches the resting tab).
@@ -806,6 +815,47 @@ private struct MacSidebarFloatingGhost: View {
                     lineWidth: isSelected ? 0.5 : 1
                 )
         }
+    }
+
+    /// Combined-tile ghost for a split dragged over Essentials — two note
+    /// cards side by side in one tray, matching the resting Essentials split
+    /// tile so the pickup→drop handoff has no shape pop.
+    private func splitTileGhost(primary: Note, secondary: Note) -> some View {
+        let tileWidth = session.draggedTileWidth
+            ?? session.tierFrames[.favorite]?.width ?? rowWidth
+        return HStack(spacing: 4) {
+            splitTileGhostHalf(primary)
+            splitTileGhostHalf(secondary)
+        }
+        .padding(3)
+        .frame(width: max(120, tileWidth), height: CrossTierDragSession.favoriteCellHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(selectionFill)
+        )
+        .overlay(alignment: .topTrailing) {
+            Image(systemName: "rectangle.split.2x1.fill")
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle(selectionInk.opacity(0.4))
+                .padding(7)
+        }
+    }
+
+    private func splitTileGhostHalf(_ note: Note) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MacNoteMiniIcon(note: note, size: 24, ink: selectionInk)
+            Text(note.title)
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(selectionInk)
+        }
+        .frame(maxWidth: .infinity, minHeight: 56, maxHeight: .infinity, alignment: .topLeading)
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.5 : 0.92))
+        )
     }
 
     /// Big floating page-tile shown while dragging over the editor.
@@ -920,6 +970,10 @@ private struct MacSidebarFloatingGhost: View {
         // Locked at release so the @Query-driven count refresh can't
         // resize the tile mid-snap.
         if let frozen = session.frozenTileWidth { return frozen }
+        // Match the exact resting tile width measured at pickup (the unified
+        // flow's cell width may differ from a count-based estimate when split
+        // tiles are present). `-16` for the tile's internal h-padding.
+        if let w = session.draggedTileWidth { return w - 16 }
         let gridWidth = session.tierFrames[.favorite]?.width ?? 0
         guard gridWidth > 0 else { return 88 }
         let stored = session.noteCountsByTier[.favorite] ?? 0
@@ -1612,8 +1666,19 @@ private struct MacSpaceNotesColumn: View {
     /// Every split whose notes belong to this column. The row whose slot
     /// renders a pair is normally the primary, falling back to the secondary
     /// when the primary has no visible list row.
+    /// A split with at least one Essential (favorite) member is hosted as a
+    /// combined tile in the Essentials section, so it does NOT render a pill in
+    /// this column and both its members are pulled from the row list. Only
+    /// splits with no Essential member keep their combined pill here.
+    private func isEssentialsHosted(_ split: EditorSplit) -> Bool {
+        let p = notes.first { $0.id == split.primaryID }
+        let s = notes.first { $0.id == split.secondaryID }
+        return p?.tier == .favorite || s?.tier == .favorite
+    }
+
     private var splitPairs: [MacSidebarSplitPair] {
         activeSplits.compactMap { split in
+            guard !isEssentialsHosted(split) else { return nil }
             guard let primary = notes.first(where: { $0.id == split.primaryID }),
                   let secondary = notes.first(where: { $0.id == split.secondaryID }),
                   // Favorites are global (`space == nil`) — they belong to
@@ -1632,9 +1697,17 @@ private struct MacSpaceNotesColumn: View {
         }
     }
     private var hiddenSplitIDs: Set<UUID> {
-        Set(splitPairs.map { pair in
+        // Non-Essentials splits: hide the non-anchor member (the pill stands in).
+        var ids = Set(splitPairs.map { pair in
             pair.anchorID == pair.primary.id ? pair.secondary.id : pair.primary.id
         })
+        // Essentials-hosted splits: hide BOTH members — they live only in the
+        // Essentials combined tile now.
+        for split in activeSplits where isEssentialsHosted(split) {
+            ids.insert(split.primaryID)
+            ids.insert(split.secondaryID)
+        }
+        return ids
     }
 
     private func notesFor(tier: NoteTier) -> [Note] {
@@ -1676,12 +1749,13 @@ private struct MacSplitTabRow: View {
     var tint: Color = .accentColor
 
     private var elevatedFill: Color { tint.elevatedSelectionFill(scheme: colorScheme) }
+    private var subTabInk: Color { elevatedFill.selectionInk }
 
     var body: some View {
         HStack(spacing: 4) {
-            subTab(primary)
+            subTab(primary, isFocused: isFocused)
             if let secondary {
-                subTab(secondary)
+                subTab(secondary, isFocused: isFocused)
                 if onSeparate != nil || showsSeparateIndicator {
                     separateControl
                 }
@@ -1696,7 +1770,14 @@ private struct MacSplitTabRow: View {
                 // (a translucent fill's shadow is nearly invisible) and matches
                 // a selected note pill.
                 .fill(isFocused ? elevatedFill
-                                : Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.09))
+                                : Color.primary.opacity(colorScheme == .dark ? 0.07 : 0.05))
+                // Tinted hairline frames the focused split so its colored tray
+                // reads as selected against the (also-tinted) sidebar.
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(isFocused ? tint.opacity(colorScheme == .dark ? 0.45 : 0.40) : .clear,
+                                      lineWidth: 1)
+                }
                 .shadow(
                     color: isFocused ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.16) : .clear,
                     radius: isFocused ? 5 : 0, x: 0, y: isFocused ? 2 : 0
@@ -1745,12 +1826,15 @@ private struct MacSplitTabRow: View {
         )
     }
 
-    private func subTab(_ note: Note) -> some View {
+    private func subTab(_ note: Note, isFocused: Bool) -> some View {
         HStack(spacing: 7) {
-            MacNoteMiniIcon(note: note, size: 16)
+            MacNoteMiniIcon(note: note, size: 16, ink: isFocused ? subTabInk : nil)
             Text(note.title)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.85))
+                // Focused: bright opaque card + bold readable ink (matches a
+                // selected note pill). Unfocused: flat, recessed, dimmed — so
+                // the two states no longer read as near-identical white cards.
+                .font(.system(size: 12, weight: isFocused ? .semibold : .medium))
+                .foregroundStyle(isFocused ? subTabInk : Color.primary.opacity(0.55))
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
@@ -1760,7 +1844,9 @@ private struct MacSplitTabRow: View {
         .frame(height: 30)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.5 : 0.92))
+                .fill(isFocused
+                      ? Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.5 : 0.92)
+                      : Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.04))
         )
     }
 
@@ -1887,6 +1973,36 @@ private struct NewNoteRow: View {
     }
 }
 
+/// Per-subview column span for `EssentialsFlowLayout` (single tile = 1,
+/// combined split tile = 2).
+private struct EssentialsSpanKey: LayoutValueKey {
+    static let defaultValue: Int = 1
+}
+
+/// Greedy wrapping grid where each child occupies `EssentialsSpanKey` columns.
+/// Delegates the geometry to `CrossTierDragSession.essentialsLayout` so the
+/// rendered tiles match the drag hit-test exactly.
+private struct EssentialsFlowLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? 0
+        let spans = subviews.map { $0[EssentialsSpanKey.self] }
+        let (_, h) = CrossTierDragSession.essentialsLayout(spans: spans, gridWidth: width)
+        return CGSize(width: width, height: h)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let spans = subviews.map { $0[EssentialsSpanKey.self] }
+        let (rects, _) = CrossTierDragSession.essentialsLayout(spans: spans, gridWidth: bounds.width)
+        for (i, sv) in subviews.enumerated() where i < rects.count {
+            let r = rects[i]
+            sv.place(
+                at: CGPoint(x: bounds.minX + r.minX, y: bounds.minY + r.minY),
+                proposal: ProposedViewSize(width: r.width, height: r.height)
+            )
+        }
+    }
+}
+
 private struct MacEssentialsRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.modelContext) private var modelContext
@@ -1896,9 +2012,13 @@ private struct MacEssentialsRow: View {
     let selectedNoteID: UUID?
     let selectNote: (Note) -> Void
     let session: CrossTierDragSession
-    /// Notes currently in a split — their Essentials tile is dimmed + badged
-    /// because the live split pill lives in the row list below.
+    /// Notes currently in a split — used for the pending pick-mode dim.
     var splitMemberIDs: Set<UUID> = []
+    /// Active editor splits. Any split with an Essential member renders here as
+    /// a combined tile (and is pulled from the normal row sections).
+    var activeSplits: [EditorSplit] = []
+    /// Separate a split back into individual notes.
+    var dissolveSplit: (UUID, NoteTier, Space) -> Void = { _, _, _ in }
     /// Release a dragged tile over the editor → split the open note with it.
     var onSplitDrop: (Note, SplitDropSide) -> Void = { _, _ in }
     /// Shared multi-select set (⌘/⇧-click) + batch action, mirroring the rows.
@@ -1909,6 +2029,35 @@ private struct MacEssentialsRow: View {
 
     private var spaceColor: Color {
         Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
+    }
+
+    private struct EssentialsSplit: Identifiable {
+        let primary: Note
+        let secondary: Note
+        var id: UUID { primary.id }
+    }
+
+    /// Splits that have at least one Essential member → rendered as a combined
+    /// tile at the top of the Essentials section.
+    private var essentialsSplits: [EssentialsSplit] {
+        activeSplits.compactMap { split in
+            guard let primary = allNotes.first(where: { $0.id == split.primaryID }),
+                  let secondary = allNotes.first(where: { $0.id == split.secondaryID }),
+                  primary.tier == .favorite || secondary.tier == .favorite
+            else { return nil }
+            return EssentialsSplit(primary: primary, secondary: secondary)
+        }
+    }
+
+    /// Favorite members shown inside a combined split tile → excluded from the
+    /// single-tile grid so they aren't duplicated.
+    private var splitFavoriteIDs: Set<UUID> {
+        var ids = Set<UUID>()
+        for s in essentialsSplits {
+            if s.primary.tier == .favorite { ids.insert(s.primary.id) }
+            if s.secondary.tier == .favorite { ids.insert(s.secondary.id) }
+        }
+        return ids
     }
 
     /// ⌘ toggles membership, ⇧ selects a range over the favorites order, plain
@@ -1961,146 +2110,188 @@ private struct MacEssentialsRow: View {
 
     private let rowHeight = CrossTierDragSession.noteRowHeight
 
-    /// Live-reorder display list. When the user is dragging a note over
-    /// the Essentials grid (either an existing favorite being reordered,
-    /// or a row from another tier being promoted), the dragged note is
-    /// placed at `session.currentIndex` and the rest shift around it.
-    private var visualNotes: [Note] {
-        if session.isMulti {
-            // Lift the dragged set out of the grid (the stack ghost carries it).
-            var base = Array(notes.prefix(8)).filter { !session.isDragged($0.id) }
-            // Over Essentials (reorder/promote target): reserve the group's
-            // cells at the grid hit-test index so the grid opens a gap that
-            // tracks the cursor (cells render at opacity 0 via `isSource`).
-            if session.isActive, session.currentTier == .favorite {
-                let movers = session.draggedNoteIDs.compactMap { id in allNotes.first { $0.id == id } }
-                let idx = min(max(0, session.currentIndex), base.count)
-                base.insert(contentsOf: movers, at: idx)
-            }
-            return Array(base.prefix(8))
-        }
-        let displayed = Array(notes.prefix(8))
-        guard session.isActive, session.currentTier == .favorite else {
-            return displayed
-        }
-        // Within-Essentials reorder: source is already in `notes`.
-        if session.sourceTier == .favorite,
-           let id = session.draggedNoteID,
-           let sourceIdx = displayed.firstIndex(where: { $0.id == id }) {
-            var result = displayed
-            let moved = result.remove(at: sourceIdx)
-            result.insert(moved, at: min(session.currentIndex, result.count))
-            return result
-        }
-        // Cross-tier promotion in progress: source isn't in favorites yet,
-        // but the user has the cursor over the grid. Insert a placeholder
-        // at currentIndex so the other tiles reflow to show the landing
-        // slot. The inserted note's tier is still its original (.pinned /
-        // .random), so `isSource` returns true → rendered opacity 0.
-        if session.sourceTier != .favorite,
-           let id = session.draggedNoteID,
-           let sourceNote = allNotes.first(where: { $0.id == id }) {
-            // If the data commit has already landed (between
-            // `performMove` and `session.reset`), the source is now in
-            // `displayed` naturally — inserting again would render the
-            // same id twice and produce a one-frame flicker on release.
-            if displayed.contains(where: { $0.id == id }) {
-                return displayed
-            }
-            var result = displayed
-            result.insert(sourceNote, at: min(session.currentIndex, result.count))
-            return Array(result.prefix(8))
-        }
-        return displayed
+    /// Measured frame (in `"notes-column"` coords) of every rendered Essentials
+    /// entry (single tile, combined split tile, or the live drag gap), keyed by
+    /// entry id, so a drag can anchor its ghost / settle target to real geometry.
+    @State private var entryFrames: [UUID: CGRect] = [:]
+    /// Stable id for the single live drag-gap placeholder so SwiftUI animates
+    /// it rather than rebuilding it as it moves between slots.
+    @State private var essentialsGapID = UUID()
+
+    /// Full favorites list in stored order (includes split members). The whole
+    /// unified grid — singles AND split tiles — is indexed in THIS note space,
+    /// so the existing reorder / promote / demote commits stay unchanged.
+    private var favoritesByOrder: [Note] {
+        Array(notes.sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+            .prefix(8))
     }
 
-    private var gridColumns: [GridItem] {
-        // Honor the frozen column count through a promote's commit so
-        // the grid doesn't briefly relayout to a wider, fewer-column
-        // state while @Query catches up.
-        let n = session.frozenFavoriteColumnCount
-            ?? CrossTierDragSession.favoriteColumnCount(for: max(visualNotes.count, 1))
-        return Array(repeating: GridItem(.flexible(), spacing: 7), count: n)
+    /// Single-tile favorites (full favorites minus split-hosted members). Kept
+    /// for the section-collapse check.
+    private var visibleFavorites: [Note] {
+        notes.filter { !splitFavoriteIDs.contains($0.id) }
+    }
+
+    /// Favorite note id → the combined split tile that hosts it.
+    private var splitByFavoriteMember: [UUID: EssentialsSplit] {
+        var m: [UUID: EssentialsSplit] = [:]
+        for s in essentialsSplits {
+            if s.primary.tier == .favorite { m[s.primary.id] = s }
+            if s.secondary.tier == .favorite { m[s.secondary.id] = s }
+        }
+        return m
+    }
+
+    private enum EssentialsEntryKind {
+        case single(Note)
+        case split(EssentialsSplit)
+        case gap
+    }
+    private struct EssentialsEntry: Identifiable {
+        let id: UUID
+        let kind: EssentialsEntryKind
+        let span: Int       // columns occupied: single 1, split 2
+        let noteCount: Int  // favorite notes represented (for index mapping)
+        var isGap: Bool { if case .gap = kind { return true }; return false }
+    }
+
+    /// Unified ordered grid entries (no drag applied): walk favorites in order,
+    /// emitting a 2-wide split tile once per split and a 1-wide single tile
+    /// otherwise.
+    private var restingEntries: [EssentialsEntry] {
+        let splitMap = splitByFavoriteMember
+        var out: [EssentialsEntry] = []
+        var seen = Set<UUID>()
+        for fav in favoritesByOrder {
+            if let s = splitMap[fav.id] {
+                if seen.contains(s.id) { continue }
+                seen.insert(s.id)
+                let favCount = (s.primary.tier == .favorite ? 1 : 0)
+                    + (s.secondary.tier == .favorite ? 1 : 0)
+                out.append(EssentialsEntry(id: s.id, kind: .split(s), span: 2, noteCount: max(1, favCount)))
+            } else {
+                out.append(EssentialsEntry(id: fav.id, kind: .single(fav), span: 1, noteCount: 1))
+            }
+        }
+        return out
+    }
+
+    /// Favorite note ids currently being dragged out of the grid (only when the
+    /// drag originated in Essentials — a promote from a list tier excludes none).
+    private var draggedFavoriteIDs: Set<UUID> {
+        guard session.isActive, session.sourceTier == .favorite else { return [] }
+        return Set(session.draggedNoteIDs)
+    }
+
+    /// Resting entries with the dragged entry lifted out (it becomes the
+    /// floating ghost). This is the layout the hit-test measures against.
+    private var restingEntriesExDragged: [EssentialsEntry] {
+        let dragged = draggedFavoriteIDs
+        guard !dragged.isEmpty else { return restingEntries }
+        return restingEntries.filter { entry in
+            switch entry.kind {
+            case .single(let n): return !dragged.contains(n.id)
+            case .split(let s): return !(dragged.contains(s.primary.id) || dragged.contains(s.secondary.id))
+            case .gap: return true
+            }
+        }
+    }
+
+    private var favoriteEntryTuples: [(span: Int, noteCount: Int)] {
+        restingEntriesExDragged.map { ($0.span, $0.noteCount) }
+    }
+
+    /// Change token so we only re-publish the layout to the session when the
+    /// resting entry set actually changes.
+    private var favoriteLayoutKey: String {
+        restingEntriesExDragged
+            .map { "\($0.id)-\($0.span)-\($0.noteCount)" }
+            .joined(separator: ",")
+    }
+
+    /// First entry index whose accumulated `noteCount` reaches `ni`.
+    private func entryInsertionIndex(forNoteIndex ni: Int, in entries: [EssentialsEntry]) -> Int {
+        var acc = 0
+        for (i, e) in entries.enumerated() {
+            if acc >= ni { return i }
+            acc += e.noteCount
+        }
+        return entries.count
+    }
+
+    /// Is this entry the one currently being dragged within Essentials? (It
+    /// stays rendered — invisibly — so the gesture-owning view is never removed
+    /// from the hierarchy mid-drag, which would freeze the drag.)
+    private func isDraggedEntry(_ entry: EssentialsEntry) -> Bool {
+        let dragged = draggedFavoriteIDs
+        guard !dragged.isEmpty else { return false }
+        switch entry.kind {
+        case .single(let n): return dragged.contains(n.id)
+        case .split(let s): return dragged.contains(s.primary.id) || dragged.contains(s.secondary.id)
+        case .gap: return false
+        }
+    }
+
+    /// Live drag display order. Within-Essentials: the dragged entry is LIFTED
+    /// to the drop slot but kept in the list (rendered at opacity 0 — it is its
+    /// own placeholder). Promote from a list tier: the source isn't a favorite
+    /// yet, so a separate `.gap` reserves the landing slot.
+    private var displayedEntries: [EssentialsEntry] {
+        let entries = restingEntries
+        guard session.isActive, session.currentTier == .favorite else { return entries }
+        if draggedFavoriteIDs.isEmpty {
+            var result = entries
+            let span = max(1, session.draggedCount)
+            let ei = entryInsertionIndex(forNoteIndex: session.currentIndex, in: result)
+            let gap = EssentialsEntry(id: essentialsGapID, kind: .gap, span: span, noteCount: span)
+            result.insert(gap, at: min(max(0, ei), result.count))
+            return result
+        }
+        let moving = entries.filter { isDraggedEntry($0) }
+        var rest = entries.filter { !isDraggedEntry($0) }
+        let ei = entryInsertionIndex(forNoteIndex: session.currentIndex, in: rest)
+        rest.insert(contentsOf: moving, at: min(max(0, ei), rest.count))
+        return rest
+    }
+
+    /// Full-favorites note index of a given note (drag source index).
+    private func favoritesNoteIndex(_ id: UUID) -> Int {
+        favoritesByOrder.firstIndex { $0.id == id } ?? 0
+    }
+
+    /// Analytic rect (in `"notes-column"` coords) of a resting entry, computed
+    /// from the SAME flow math the renderer uses — reliable at pickup (no
+    /// dependency on when `onGeometryChange` last fired). Used to anchor the
+    /// drag ghost's center + width to the exact resting tile.
+    private func restingEntryRect(_ id: UUID) -> CGRect? {
+        guard let frame = session.tierFrames[.favorite], frame.width > 0 else { return nil }
+        let entries = restingEntries
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return nil }
+        let (rects, _) = CrossTierDragSession.essentialsLayout(
+            spans: entries.map { $0.span }, gridWidth: frame.width)
+        guard idx < rects.count else { return nil }
+        return rects[idx].offsetBy(dx: frame.minX, dy: frame.minY)
     }
 
     var body: some View {
-        LazyVGrid(columns: gridColumns, spacing: 7) {
-            ForEach(visualNotes, id: \.id) { note in
-                let originalIndex = notes.firstIndex { $0.id == note.id } ?? 0
-                // Highlighted when multi-selected, else when it's the open note.
-                // A split member's focus lives in the row-list pill, so its
-                // tile drops the "selected" treatment and just reads as dimmed.
-                let isSelected = (selection.isActive ? selection.contains(note.id) : selectedNoteID == note.id)
-                    && !splitMemberIDs.contains(note.id)
-                // Hide the dragged note's real cell for the WHOLE drag +
-                // snap, regardless of its committed tier. During a
-                // promote the commit lands mid-snap and flips the note's
-                // tier to .favorite — without this guard `isSource` went
-                // false and the real grid tile appeared *while the ghost
-                // was still flying in*, producing a double-render that
-                // read as a width glitch. The cell reappears only when
-                // `session.reset()` clears `draggedNoteID`.
-                let isSource = session.isDragged(note.id)
-                    || session.draggedNoteID == note.id
-                    || note.tier != .favorite
-                // In a split: the live pill lives in the row list, so dim this
-                // tile + badge it to show the link without duplicating focus.
-                let inSplit = splitMemberIDs.contains(note.id)
-
-                let tileFill = spaceColor.elevatedSelectionFill(scheme: colorScheme)
-                let tileInk = tileFill.selectionInk
-                VStack(alignment: .leading, spacing: 8) {
-                    MacNoteMiniIcon(note: note, size: 24, ink: isSelected ? tileInk : nil)
-                    Text(note.title)
-                        .font(.system(size: 11, weight: .medium))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(isSelected ? tileInk : Color.primary.opacity(0.82))
-                }
-                .frame(maxWidth: .infinity, minHeight: 66, alignment: .topLeading)
-                .padding(8)
-                .background {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(isSelected ? tileFill : Color.primary.opacity(0.06))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .strokeBorder(
-                                    isSelected
-                                    ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
-                                    : Color.primary.opacity(0.06),
-                                    lineWidth: isSelected ? 0.5 : 1
-                                )
-                        }
-                        .shadow(
-                            color: isSelected ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear,
-                            radius: isSelected ? 4 : 0, x: 0, y: isSelected ? 1.5 : 0
-                        )
-                }
-                .overlay(alignment: .topTrailing) {
-                    if inSplit {
-                        Image(systemName: "rectangle.split.2x1.fill")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.primary.opacity(0.5))
-                            .padding(5)
+        EssentialsFlowLayout {
+            ForEach(displayedEntries) { entry in
+                entryContent(entry)
+                    .opacity(isDraggedEntry(entry) ? 0 : 1)
+                    .onGeometryChange(for: CGRect.self) { proxy in
+                        proxy.frame(in: .named("notes-column"))
+                    } action: { newFrame in
+                        entryFrames[entry.id] = newFrame
                     }
-                }
-                .opacity(inSplit ? 0.55 : 1)
-                .opacity(isSource ? 0 : 1)
-                .contentShape(Rectangle())
-                .onTapGesture { handleTileClick(note) }
-                .gesture(tileDragGesture(for: note, at: originalIndex))
-                .contextMenu { tileMenu(note) }
+                    // `.layoutValue` must be the OUTERMOST modifier so the
+                    // EssentialsFlowLayout actually reads each entry's span
+                    // (otherwise every tile defaults to 1 column).
+                    .layoutValue(key: EssentialsSpanKey.self, value: entry.span)
             }
         }
-        // Animate the live reorder reflow on `currentIndex` / count only.
-        // Deliberately NOT keyed on `draggedNoteID`: including it made
-        // `session.reset()` on release fire a second grid animation that
-        // raced the ghost's snap, producing the pre-snap glitch. Without
-        // it, release is a clean instant handoff — the ghost snaps, then
-        // the committed tile appears in place with no competing reflow.
+        // Reflow the gap/tiles as the drop slot or resting set changes.
         .animation(.smooth(duration: 0.18),
-                   value: "\(session.currentIndex)|\(visualNotes.count)")
-        .padding(2)
+                   value: "\(session.currentIndex)|\(restingEntriesExDragged.count)")
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(spaceColor.opacity(isCrossTierTarget ? 0.65 : 0), lineWidth: 1.5)
@@ -2113,12 +2304,178 @@ private struct MacEssentialsRow: View {
         }
         .onAppear {
             session.noteCountsByTier[.favorite] = notes.count
+            session.favoriteEntryLayout = favoriteEntryTuples
             releaseColumnFreezeIfSettled(count: notes.count)
         }
         .onChange(of: notes.count) { _, newValue in
             session.noteCountsByTier[.favorite] = newValue
             releaseColumnFreezeIfSettled(count: newValue)
         }
+        .onChange(of: favoriteLayoutKey) { _, _ in
+            session.favoriteEntryLayout = favoriteEntryTuples
+        }
+    }
+
+    @ViewBuilder
+    private func entryContent(_ entry: EssentialsEntry) -> some View {
+        switch entry.kind {
+        case .single(let note): singleTileView(note)
+        case .split(let split): essentialsSplitTile(split)
+        case .gap: Color.clear
+        }
+    }
+
+    /// One single-note Essentials tile (icon + title), with tap / drag /
+    /// context-menu. Width is driven by the flow layout (1 column).
+    private func singleTileView(_ note: Note) -> some View {
+        let isSelected = (selection.isActive ? selection.contains(note.id) : selectedNoteID == note.id)
+            && !splitMemberIDs.contains(note.id)
+        let inSplit = splitMemberIDs.contains(note.id)
+        let tileFill = spaceColor.elevatedSelectionFill(scheme: colorScheme)
+        let tileInk = tileFill.selectionInk
+        return VStack(alignment: .leading, spacing: 8) {
+            MacNoteMiniIcon(note: note, size: 24, ink: isSelected ? tileInk : nil)
+            Text(note.title)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(isSelected ? tileInk : Color.primary.opacity(0.82))
+        }
+        .frame(maxWidth: .infinity, minHeight: 66, maxHeight: .infinity, alignment: .topLeading)
+        .padding(8)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isSelected ? tileFill : Color.primary.opacity(0.06))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(
+                            isSelected
+                            ? Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
+                            : Color.primary.opacity(0.06),
+                            lineWidth: isSelected ? 0.5 : 1
+                        )
+                }
+                .shadow(
+                    color: isSelected ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.14) : .clear,
+                    radius: isSelected ? 4 : 0, x: 0, y: isSelected ? 1.5 : 0
+                )
+        }
+        .overlay(alignment: .topTrailing) {
+            if inSplit {
+                Image(systemName: "rectangle.split.2x1.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.5))
+                    .padding(5)
+            }
+        }
+        .opacity(inSplit ? 0.55 : 1)
+        .contentShape(Rectangle())
+        .onTapGesture { handleTileClick(note) }
+        .gesture(tileDragGesture(for: note))
+        .contextMenu { tileMenu(note) }
+    }
+
+    /// A split rendered to match the Essentials grid: two note-cards (icon +
+    /// title, like the square tiles) side by side inside one faint grouping
+    /// container, with a split badge and a Separate action. Width is driven by
+    /// the flow layout (2 columns).
+    private func essentialsSplitTile(_ split: EssentialsSplit) -> some View {
+        let isFocused = selectedNoteID == split.primary.id
+            || selectedNoteID == split.secondary.id
+        let elevated = spaceColor.elevatedSelectionFill(scheme: colorScheme)
+        let ink = elevated.selectionInk
+        return HStack(spacing: 4) {
+            essentialsSplitHalf(split.primary, isFocused: isFocused, ink: ink)
+            essentialsSplitHalf(split.secondary, isFocused: isFocused, ink: ink)
+        }
+        .padding(3)
+        .frame(maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(isFocused ? elevated
+                                : Color.primary.opacity(colorScheme == .dark ? 0.07 : 0.05))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(isFocused ? spaceColor.opacity(colorScheme == .dark ? 0.45 : 0.40) : .clear,
+                                      lineWidth: 1)
+                }
+                .shadow(
+                    color: isFocused ? Color.black.opacity(colorScheme == .dark ? 0.45 : 0.16) : .clear,
+                    radius: isFocused ? 5 : 0, x: 0, y: isFocused ? 2 : 0
+                )
+        )
+        .overlay(alignment: .topTrailing) {
+            Image(systemName: "rectangle.split.2x1.fill")
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle((isFocused ? ink : .primary).opacity(0.4))
+                .padding(7)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { selectNote(split.primary) }
+        .gesture(splitTileDragGesture(for: split))
+        .contextMenu {
+            Button("Separate Notes", systemImage: "rectangle.split.2x1.slash") {
+                dissolveSplit(split.primary.id, .favorite, space)
+            }
+        }
+    }
+
+    /// Drag the whole combined tile: both notes move together and the split is
+    /// preserved. Over Essentials the ghost is the combined tile (and the grid
+    /// reflows a 2-wide gap); over a list tier it morphs to the row split pill
+    /// and, on release, lands there as a pinned/notes split (never dissolves).
+    private func splitTileDragGesture(for split: EssentialsSplit) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("notes-column"))
+            .onChanged { value in
+                if session.draggedNoteID == nil {
+                    session.dragGeneration &+= 1
+                    let startIndex = favoritesNoteIndex(split.primary.id)
+                    session.draggedNoteID = split.primary.id
+                    session.draggedNoteIDs = [split.primary.id]
+                    session.sourceTier = .favorite
+                    session.sourceSpaceID = space.id
+                    session.sourceIndex = startIndex
+                    session.currentTier = .favorite
+                    session.currentIndex = startIndex
+                    let rect = restingEntryRect(split.id) ?? entryFrames[split.id]
+                    session.sourceRowCenter = rect.map { CGPoint(x: $0.midX, y: $0.midY) }
+                        ?? value.startLocation
+                    session.draggedTileWidth = rect?.width
+                    session.noteCountsByTier[.favorite] = notes.count
+                    session.favoriteEntryLayout = favoriteEntryTuples
+                }
+                session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
+            }
+            .onEnded { _ in
+                let stuckID = session.draggedNoteID
+                let gen = session.dragGeneration
+                commitTileDrag()
+                session.scheduleWatchdog(for: stuckID, generation: gen)
+            }
+    }
+
+    private func essentialsSplitHalf(_ note: Note, isFocused: Bool,
+                                     ink: Color) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MacNoteMiniIcon(note: note, size: 24, ink: isFocused ? ink : nil)
+            Text(note.title)
+                .font(.system(size: 11, weight: isFocused ? .semibold : .medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(isFocused ? ink : Color.primary.opacity(0.55))
+        }
+        .frame(maxWidth: .infinity, minHeight: 56, maxHeight: .infinity, alignment: .topLeading)
+        .padding(8)
+        .background(
+            // Focused halves are bright opaque cards on the tinted tray;
+            // unfocused halves recede to a flat dim fill so selection is
+            // unmistakable rather than near-white-on-near-white.
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isFocused
+                      ? Color(nsColor: .windowBackgroundColor)
+                          .opacity(colorScheme == .dark ? 0.5 : 0.92)
+                      : Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.04))
+        )
     }
 
     /// Clears the column-count freeze once the live count produces the
@@ -2134,14 +2491,15 @@ private struct MacEssentialsRow: View {
         withTransaction(tx) { session.frozenFavoriteColumnCount = nil }
     }
 
-    /// Essentials grid is a 2D layout, so we don't run any within-grid
-    /// reorder — the tile just follows the cursor while dragging. On release,
-    /// if the cursor sits in another tier, perform a demote.
-    private func tileDragGesture(for note: Note, at index: Int) -> some Gesture {
+    /// Single-tile drag in the unified Essentials grid: the tile follows the
+    /// cursor while the grid reflows a 1-wide gap. On release it reorders
+    /// within Essentials or demotes to another tier.
+    private func tileDragGesture(for note: Note) -> some Gesture {
         DragGesture(minimumDistance: 2, coordinateSpace: .named("notes-column"))
             .onChanged { value in
                 if session.draggedNoteID == nil {
                     session.dragGeneration &+= 1
+                    let startIndex = favoritesNoteIndex(note.id)
                     session.draggedNoteID = note.id
                     // Multi-tile drag: the whole selection moves together (e.g.
                     // demote a batch of essentials to Notes). Else a single tile.
@@ -2155,12 +2513,15 @@ private struct MacEssentialsRow: View {
                     }
                     session.sourceTier = .favorite
                     session.sourceSpaceID = space.id
-                    session.sourceIndex = index
+                    session.sourceIndex = startIndex
                     session.currentTier = .favorite
-                    session.currentIndex = index
-                    session.sourceRowCenter = essentialsCellCenter(forIndex: index)
+                    session.currentIndex = startIndex
+                    let rect = restingEntryRect(note.id) ?? entryFrames[note.id]
+                    session.sourceRowCenter = rect.map { CGPoint(x: $0.midX, y: $0.midY) }
                         ?? value.startLocation
+                    session.draggedTileWidth = rect?.width
                     session.noteCountsByTier[.favorite] = notes.count
+                    session.favoriteEntryLayout = favoriteEntryTuples
                 }
                 // 2D translation — both axes so the ghost can move freely
                 // through the grid while reshuffling other tiles.
@@ -2174,24 +2535,15 @@ private struct MacEssentialsRow: View {
             }
     }
 
-    /// Returns the visual center of the cell at `index` in the Essentials
-    /// grid, in `"notes-column"` coords. Returns nil if the grid frame
-    /// hasn't been measured yet.
-    private func essentialsCellCenter(forIndex index: Int) -> CGPoint? {
-        let frame = session.tierFrames[.favorite] ?? .zero
-        guard frame.width > 0 else { return nil }
-        let spacing = CrossTierDragSession.favoriteCellSpacing
-        let pad = CrossTierDragSession.favoriteGridPadding
-        let cellH = CrossTierDragSession.favoriteCellHeight
-        let count = max(notes.count, 1)
-        let N = CrossTierDragSession.favoriteColumnCount(for: count)
-        let cellW = CrossTierDragSession.favoriteCellWidth(gridWidth: frame.width, count: count)
-        let col = index % N
-        let row = index / N
-        return CGPoint(
-            x: frame.minX + pad + CGFloat(col) * (cellW + spacing) + cellW / 2,
-            y: frame.minY + pad + CGFloat(row) * (cellH + spacing) + cellH / 2
-        )
+    /// Center of where the dragged tile will land, in `"notes-column"` coords.
+    /// Within-Essentials the dragged entry itself is the placeholder (id ==
+    /// `draggedNoteID`); a promote uses the separate gap placeholder.
+    private func essentialsDropCenter() -> CGPoint? {
+        let id = draggedFavoriteIDs.isEmpty
+            ? essentialsGapID
+            : (session.draggedNoteID ?? essentialsGapID)
+        guard let r = entryFrames[id], r.width > 0 else { return nil }
+        return CGPoint(x: r.midX, y: r.midY)
     }
 
     private func commitTileDrag() {
@@ -2199,6 +2551,11 @@ private struct MacEssentialsRow: View {
         // (favorites isn't a multi-drop target, so a release over the grid just
         // snaps the stack back). Mirrors the row multi-drag commit.
         if session.isMulti { commitMultiTileDrag(); return }
+        // Dragging a combined split tile → move both members together, keeping
+        // the split (morphs to a row split pill in a list tier).
+        if let esplit = essentialsSplits.first(where: { $0.primary.id == session.draggedNoteID }) {
+            commitEssentialsSplitDrag(esplit); return
+        }
         guard let id = session.draggedNoteID,
               let source = allNotes.first(where: { $0.id == id }) else {
             wipe()
@@ -2230,28 +2587,30 @@ private struct MacEssentialsRow: View {
         session.frozenAsTile = (dest == .favorite)
 
         if dest == .favorite, let gw = session.tierFrames[.favorite]?.width, gw > 0 {
-            // Reorder keeps the count; promote adds one.
+            // Total column-units after the drop (singles 1, split tiles 2);
+            // a promote adds one single unit. Drives both the ghost's frozen
+            // width and the column-count lock.
             let isPromote = session.sourceTier != .favorite
-            let finalCount = isPromote ? notes.count + 1 : notes.count
+            let restingUnits = restingEntries.reduce(0) { $0 + $1.span }
+            let landedUnits = max(1, restingUnits + (isPromote ? 1 : 0))
             session.frozenTileWidth = CrossTierDragSession.favoriteCellWidth(
-                gridWidth: gw, count: max(finalCount, 1)
+                gridWidth: gw, count: landedUnits
             ) - 16
             // For a promote, also lock the grid's column count to the
             // post-commit value so the whole grid doesn't resize during
             // the @Query lag. Cleared once notes.count catches up.
             if isPromote {
                 session.frozenFavoriteColumnCount =
-                    CrossTierDragSession.favoriteColumnCount(for: max(finalCount, 1))
+                    CrossTierDragSession.favoriteColumnCount(for: landedUnits)
             }
         }
 
         let destFrame = session.tierFrames[dest] ?? .zero
-        // For grid destinations (within-Essentials reorder), pick the
-        // target cell's center. For row destinations (demote), use the
-        // row slot's Y midpoint.
+        // For grid destinations (within-Essentials reorder), aim at the live
+        // gap's center. For row destinations (demote), use the row slot's Y.
         let targetCenterX: CGFloat
         let targetCenterY: CGFloat
-        if dest == .favorite, let cell = essentialsCellCenter(forIndex: destIndex) {
+        if dest == .favorite, let cell = essentialsDropCenter() {
             targetCenterX = cell.x
             targetCenterY = cell.y
         } else {
@@ -2265,7 +2624,7 @@ private struct MacEssentialsRow: View {
         // same amount so it lands on the slot's POST-collapse position —
         // letting us fire the data commit in parallel with the ghost
         // spring (instead of after it).
-        let essentialsWillEmpty = crossTier && notes.count == 1
+        let essentialsWillEmpty = crossTier && visibleFavorites.count == 1 && essentialsSplits.isEmpty
         let shift: CGFloat = essentialsWillEmpty ? session.essentialsSectionHeight : 0
         let targetTranslationX = targetCenterX - session.sourceRowCenter.x
         let targetTranslationY = (targetCenterY - shift) - session.sourceRowCenter.y
@@ -2277,7 +2636,7 @@ private struct MacEssentialsRow: View {
         } else if destIndex != session.sourceIndex {
             // Within-Essentials reorder: rebuild manualSortIndex now so
             // the grid lands silently when session.reset clears (the
-            // visualNotes already shows the target order during drag).
+            // the displayed entries already show the target order during drag).
             reorderFavorites(noteID: id, toIndex: destIndex)
         }
 
@@ -2304,6 +2663,91 @@ private struct MacEssentialsRow: View {
         }
     }
 
+    /// Release path for dragging a combined split tile. Both notes move
+    /// together and the `EditorSplit` is preserved: dropping back over
+    /// Essentials keeps it a combined tile (both stay/become favorites);
+    /// dropping over a list tier demotes BOTH into this space so it re-renders
+    /// as a row split pill there. Never dissolves the split.
+    private func commitEssentialsSplitDrag(_ esplit: EssentialsSplit) {
+        guard let dest = session.currentTier else { wipe(); return }
+        let primary = esplit.primary
+        let secondary = esplit.secondary
+
+        // Over the editor → not a re-split target here; snap the tile back.
+        if session.editorDropSide != nil { settleSplitTile(to: .zero); return }
+
+        if dest == .favorite {
+            // Stays an Essentials combined tile. Promote both to favorites
+            // (covers a favorite+list split fully entering Essentials), then
+            // glide the ghost to the DROP slot (not back to the start).
+            moveSplitMembers(primary: primary, secondary: secondary, to: .favorite)
+            if let cell = essentialsDropCenter() {
+                settleSplitTile(to: CGSize(
+                    width: cell.x - session.sourceRowCenter.x,
+                    height: cell.y - session.sourceRowCenter.y
+                ))
+            } else {
+                settleSplitTile(to: .zero)
+            }
+            return
+        }
+
+        // Demote both into this space's list tier → row split pill.
+        session.frozenAsTile = false
+        let destFrame = session.tierFrames[dest] ?? .zero
+        let destIndex = session.currentIndex
+        let targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight + rowHeight / 2
+        moveSplitMembers(primary: primary, secondary: secondary, to: dest)
+        settleSplitTile(to: CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y))
+    }
+
+    /// Glide the floating split ghost to `target`, then commit-reset off the
+    /// animation (so `@Query` repaints the real pill/tile before the ghost is
+    /// removed — clean handoff, no flash).
+    private func settleSplitTile(to target: CGSize) {
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = target
+        } completion: {
+            DispatchQueue.main.async {
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) { session.reset() }
+            }
+        }
+    }
+
+    /// Move both split members into `dest` (favorites are global → no space),
+    /// placed adjacently at the hit-test index, primary first. Keeps the split.
+    private func moveSplitMembers(primary: Note, secondary: Note, to dest: NoteTier) {
+        let now = Date()
+        for n in [primary, secondary] {
+            n.tier = dest
+            n.space = dest == .favorite ? nil : space
+            n.folder = nil
+            n.updatedAt = now
+        }
+        let destOthers = allNotes
+            .filter { $0.tier == dest
+                && (dest == .favorite || $0.space?.id == space.id)
+                && $0.folder == nil
+                && $0.id != primary.id && $0.id != secondary.id }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        var reordered = destOthers
+        let insertIdx = min(max(0, session.currentIndex), reordered.count)
+        reordered.insert(contentsOf: [primary, secondary], at: insertIdx)
+        for (i, n) in reordered.enumerated() { n.manualSortIndex = i }
+
+        // Renumber the favorites tier the pair may have left.
+        if dest != .favorite {
+            let leftFavorites = allNotes
+                .filter { $0.tier == .favorite && $0.id != primary.id && $0.id != secondary.id }
+                .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+            for (i, n) in leftFavorites.enumerated() { n.manualSortIndex = i }
+        }
+        try? modelContext.save()
+    }
+
     /// Release path for a multi-TILE drag — demote the dragged set as a block
     /// into the target list tier. Mirrors `MacSidebarGroup.commitMultiDrag`
     /// (favorites isn't a multi-drop target → snap back).
@@ -2315,18 +2759,10 @@ private struct MacEssentialsRow: View {
         // back when released far from the slot, like tabs/spaces).
         if dest == .favorite {
             let destIndex = session.currentIndex
-            let count = max(notes.count, 1)
-            let targetIndex = min(max(0, destIndex + session.primaryGroupIndex), count - 1)
             session.frozenAsTile = true
-            if let cell = essentialsCellCenter(forIndex: targetIndex) {
-                let frame = session.tierFrames[.favorite] ?? .zero
-                let cellW = CrossTierDragSession.favoriteCellWidth(gridWidth: frame.width, count: count)
-                let pitch = cellW + CrossTierDragSession.favoriteCellSpacing
-                // Grabbed tile's offset within the centered horizontal strip.
-                let grabbedOffsetX = (CGFloat(session.primaryGroupIndex)
-                    - CGFloat(session.draggedCount - 1) / 2) * pitch
+            if let cell = essentialsDropCenter() {
                 let target = CGSize(
-                    width: cell.x - grabbedOffsetX - session.sourceRowCenter.x,
+                    width: cell.x - session.sourceRowCenter.x,
                     height: cell.y - session.sourceRowCenter.y
                 )
                 withAnimation(.smooth(duration: 0.2)) {
@@ -2403,8 +2839,10 @@ private struct MacEssentialsRow: View {
             .filter { $0.tier == .favorite && $0.folder == nil }
             .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
         guard let source = favorites.first(where: { $0.id == noteID }) else { return }
+        // `toIndex` is an insertion index among the NON-dragged favorites
+        // (the unified grid hit-test indexes the full favorites note space).
         var reordered = favorites.filter { $0.id != noteID }
-        let insertIdx = min(toIndex, reordered.count)
+        let insertIdx = min(max(0, toIndex), reordered.count)
         reordered.insert(source, at: insertIdx)
         for (i, n) in reordered.enumerated() { n.manualSortIndex = i }
         source.updatedAt = Date()
@@ -2529,6 +2967,17 @@ final class CrossTierDragSession {
     // Tier geometry / counts, populated by each MacSidebarGroup.
     @ObservationIgnored var tierFrames: [NoteTier: CGRect] = [:]
     @ObservationIgnored var noteCountsByTier: [NoteTier: Int] = [:]
+    /// Per-entry layout of the RESTING Essentials grid (the dragged entry
+    /// excluded), in display order: `span` = columns the entry occupies
+    /// (single tile 1, combined split tile 2), `noteCount` = how many favorite
+    /// notes it represents (single 1, fav+list split 1, fav+fav split 2). The
+    /// view publishes this; the favorite hit-test uses `span` for the flow
+    /// geometry and `noteCount` to convert the entry slot to a favorites note
+    /// index (so existing reorder/promote commits stay in note-index space).
+    @ObservationIgnored var favoriteEntryLayout: [(span: Int, noteCount: Int)] = []
+    /// Measured width of the dragged Essentials tile at pickup (combined split
+    /// tile = 2 columns), so the floating ghost matches it exactly.
+    @ObservationIgnored var draggedTileWidth: CGFloat? = nil
     var favoriteDropZoneVisible: Bool = false
     var showsAddToEssentialsBanner: Bool = false
 
@@ -2547,7 +2996,7 @@ final class CrossTierDragSession {
     /// behavior of letting tiles fill the available row width. 1 → 1 col
     /// (100% wide), 2 → 2 cols (50% each), 3 → 3 cols (33% each), 4 →
     /// 2x2 (50% each), 5+ → 3 per row.
-    static func favoriteColumnCount(for count: Int) -> Int {
+    nonisolated static func favoriteColumnCount(for count: Int) -> Int {
         switch count {
         case 0, 1: return 1
         case 2:    return 2
@@ -2569,6 +3018,39 @@ final class CrossTierDragSession {
         let n = favoriteColumnCount(for: count)
         let contentWidth = gridWidth - 2 * favoriteGridPadding
         return max(0, (contentWidth - CGFloat(n - 1) * favoriteCellSpacing) / CGFloat(n))
+    }
+
+    /// Greedy wrapping flow for the unified Essentials grid where each entry
+    /// occupies `span` columns (single tile = 1, combined split tile = 2).
+    /// Returns each entry's rect in the grid's local coords (origin at the
+    /// grid's top-left, INCLUDING the `favoriteGridPadding` inset) plus the
+    /// total height. The renderer and the drag hit-test both call this so the
+    /// predicted slots match the rendered tiles to the pixel.
+    nonisolated static func essentialsLayout(spans: [Int], gridWidth: CGFloat)
+        -> (rects: [CGRect], totalHeight: CGFloat) {
+        let pad = favoriteGridPadding
+        let spacing = favoriteCellSpacing
+        let cellH = favoriteCellHeight
+        let units = max(1, spans.reduce(0) { $0 + max(1, $1) })
+        let n = max(1, favoriteColumnCount(for: units))
+        let contentWidth = gridWidth - 2 * pad
+        let unitW = max(0, (contentWidth - CGFloat(n - 1) * spacing) / CGFloat(n))
+        var rects: [CGRect] = []
+        var col = 0
+        var row = 0
+        for rawSpan in spans {
+            let s = min(max(1, rawSpan), n)
+            if col + s > n { col = 0; row += 1 }
+            let x = pad + CGFloat(col) * (unitW + spacing)
+            let y = pad + CGFloat(row) * (cellH + spacing)
+            let w = CGFloat(s) * unitW + CGFloat(s - 1) * spacing
+            rects.append(CGRect(x: x, y: y, width: w, height: cellH))
+            col += s
+        }
+        let rows = spans.isEmpty ? 0 : row + 1
+        let totalHeight = 2 * pad + CGFloat(rows) * cellH
+            + CGFloat(max(0, rows - 1)) * spacing
+        return (rects, totalHeight)
     }
 
     // Total vertical footprint of the Essentials section in the sidebar
@@ -2714,8 +3196,34 @@ final class CrossTierDragSession {
         let effective = target == sourceTier ? max(1, baseCount) : (baseCount + 1)
 
         let newIndex: Int
-        if target == .favorite, frame.width > 0 {
-            // 2D grid hit-test against the current row-fill column count.
+        if target == .favorite, frame.width > 0, !favoriteEntryLayout.isEmpty {
+            // Span-aware flow hit-test: lay out the resting entries (singles =
+            // 1 col, split tiles = 2 cols), find which reading-order slot the
+            // cursor falls into, then convert that entry slot to a favorites
+            // NOTE index via each entry's `noteCount` (so the reorder/promote
+            // commits keep operating in note-index space).
+            let spans = favoriteEntryLayout.map { $0.span }
+            let (rects, _) = Self.essentialsLayout(spans: spans, gridWidth: frame.width)
+            let cx = cursorX ?? frame.midX
+            let rowPitch = Self.favoriteCellHeight + Self.favoriteCellSpacing
+            func rowOf(_ localY: CGFloat) -> Int {
+                max(0, Int(((localY - Self.favoriteGridPadding) / rowPitch).rounded(.down)))
+            }
+            let cursorRow = rowOf(y - frame.minY)
+            var entryInsert = rects.count
+            for (i, r) in rects.enumerated() {
+                let entryRow = rowOf(r.midY)
+                let centerX = frame.minX + r.midX
+                if entryRow > cursorRow || (entryRow == cursorRow && cx < centerX) {
+                    entryInsert = i
+                    break
+                }
+            }
+            var note = 0
+            for i in 0..<entryInsert { note += favoriteEntryLayout[i].noteCount }
+            newIndex = min(max(0, note), max(0, effective - 1))
+        } else if target == .favorite, frame.width > 0 {
+            // Fallback (layout not yet published): uniform-cell 2D hit-test.
             let pad = Self.favoriteGridPadding
             let xInGrid = max(0, (cursorX ?? frame.midX) - frame.minX - pad)
             let yInGrid = max(0, y - frame.minY - pad)
@@ -2782,6 +3290,7 @@ final class CrossTierDragSession {
         currentIndex = 0
         frozenTileWidth = nil
         frozenAsTile = nil
+        draggedTileWidth = nil
         isSettling = false
         sourceSpaceID = nil
         editorDropSide = nil

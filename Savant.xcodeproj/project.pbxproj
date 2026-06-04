@@ -18,6 +18,7 @@
 		10B1273E5210058308B545FC /* Color+Scheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EF16EBD72D8F9F44E8F5F49 /* Color+Scheme.swift */; };
 		12654BDAB6AD3068A517AE68 /* GlassViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41E376E47A71AB623E7E0BBB /* GlassViews.swift */; };
 		142DA0702B2E40F327142E6E /* NoteEditPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44604743135560F4679CC526 /* NoteEditPage.swift */; };
+		168D78BB58DDF252260D6268 /* SpaceMesh.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7310CB210404088052E07A0 /* SpaceMesh.swift */; };
 		199C1A0644C0DA48369EBB7D /* SpacePagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB724E880E5CF0ED811D7984 /* SpacePagerView.swift */; };
 		203DB5DCFEA0EC35498AD68C /* OnboardingFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD3FBE920CA55A9ACFEEE481 /* OnboardingFlow.swift */; };
 		20D680E4B97EBE26ED1296C5 /* NewSpaceFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2628B9A082BCF2015D3A4508 /* NewSpaceFlowView.swift */; };
@@ -52,8 +53,10 @@
 		91B613F6A829B58214F38407 /* DropZones.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91478E1FDD3292152702A1F3 /* DropZones.swift */; };
 		98A0640D5C864DA9A8453FB4 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A6EC02B34A8F54989A60766 /* AppState.swift */; };
 		9BA6C4F8BA88DEB1BB3DB2AC /* SavantModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAD77D3DB09E100D9B6A36A4 /* SavantModelTests.swift */; };
+		9E2A6FFBC81AC736E11D3AB4 /* SpaceGradient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93894CA1F741852EE27189B3 /* SpaceGradient.swift */; };
 		A48F01A55F416D5A2291E1C1 /* SearchSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C4C97B48016127AB40DEE50 /* SearchSheet.swift */; };
 		AB294EFA1BACE6E5D4E970F6 /* RandomSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 230C6FD7AA92E96607709BA6 /* RandomSection.swift */; };
+		ADF5A73E9B2636BC3E7B7C36 /* SpaceGradient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93894CA1F741852EE27189B3 /* SpaceGradient.swift */; };
 		B464E30463426587F36D4810 /* MacNoteWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85ED9BDC6E9F78D20A59A5D5 /* MacNoteWorkspace.swift */; };
 		BC3663ACC6AC1F68D14372F2 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = F353736C12155A33A552DA26 /* Models.swift */; };
 		C3CC496532354557EF8D1ECF /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56E077784985271F419EC997 /* PersistenceController.swift */; };
@@ -66,7 +69,6 @@
 		E5EFFC26941F3B02D9EEA807 /* SpaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E86CD4BDC2CDD375D06AC94 /* SpaceView.swift */; };
 		ED57E2990513FED8CA61EEF4 /* ZenGrainDial.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71A589F2CB5E059B6BF8702C /* ZenGrainDial.swift */; };
 		F39F225910CA52B1145DFEFC /* FolderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 971235DEEEE78B209127BD68 /* FolderService.swift */; };
-		F694232A8F25F2C74E26B65E /* ZenGradientModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E7B9E83E5CF1E7AF343E205 /* ZenGradientModel.swift */; };
 		FDB75934F3C23EDC0C2B1972 /* View+HoverTracking.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6D4BBACD44434F19B6517E2 /* View+HoverTracking.swift */; };
 /* End PBXBuildFile section */
 
@@ -103,7 +105,6 @@
 		44604743135560F4679CC526 /* NoteEditPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteEditPage.swift; sourceTree = "<group>"; };
 		447C725E539B866DCAD1A0E8 /* SavantApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavantApp.swift; sourceTree = "<group>"; };
 		489D34A2482E92B07A606D88 /* SpaceHeaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceHeaderView.swift; sourceTree = "<group>"; };
-		4E7B9E83E5CF1E7AF343E205 /* ZenGradientModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZenGradientModel.swift; sourceTree = "<group>"; };
 		56E077784985271F419EC997 /* PersistenceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistenceController.swift; sourceTree = "<group>"; };
 		59572A160BD9716D35FFA6E7 /* FavoritesTileRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FavoritesTileRow.swift; sourceTree = "<group>"; };
 		5BB1DEFAA27A0DCF619FEC32 /* DraggableItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraggableItem.swift; sourceTree = "<group>"; };
@@ -119,6 +120,7 @@
 		8E86CD4BDC2CDD375D06AC94 /* SpaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceView.swift; sourceTree = "<group>"; };
 		91478E1FDD3292152702A1F3 /* DropZones.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DropZones.swift; sourceTree = "<group>"; };
 		92C83E44F84187D819128D6E /* ExpandableGlassMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExpandableGlassMenu.swift; sourceTree = "<group>"; };
+		93894CA1F741852EE27189B3 /* SpaceGradient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceGradient.swift; sourceTree = "<group>"; };
 		971235DEEEE78B209127BD68 /* FolderService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderService.swift; sourceTree = "<group>"; };
 		9A65B28ED5260A625E98C61F /* DragPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragPreview.swift; sourceTree = "<group>"; };
 		9C4C97B48016127AB40DEE50 /* SearchSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchSheet.swift; sourceTree = "<group>"; };
@@ -128,6 +130,7 @@
 		B0E8843E68FB964F30A74766 /* SettingsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSheet.swift; sourceTree = "<group>"; };
 		B5F3B07204C6F6C360684421 /* MacRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacRootView.swift; sourceTree = "<group>"; };
 		B6D4BBACD44434F19B6517E2 /* View+HoverTracking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+HoverTracking.swift"; sourceTree = "<group>"; };
+		C7310CB210404088052E07A0 /* SpaceMesh.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceMesh.swift; sourceTree = "<group>"; };
 		CDA3E541FA1E22277EC2F5D7 /* TidyBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TidyBannerView.swift; sourceTree = "<group>"; };
 		DC21ED8686A26A1826788D56 /* MultiSelectActionBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiSelectActionBar.swift; sourceTree = "<group>"; };
 		DC5D64FBA1B18B4684ECF141 /* BackgroundTaskScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundTaskScheduler.swift; sourceTree = "<group>"; };
@@ -240,6 +243,7 @@
 				0867907D732AE24CDB7F06F7 /* PinnedSection.swift */,
 				230C6FD7AA92E96607709BA6 /* RandomSection.swift */,
 				489D34A2482E92B07A606D88 /* SpaceHeaderView.swift */,
+				C7310CB210404088052E07A0 /* SpaceMesh.swift */,
 				EB724E880E5CF0ED811D7984 /* SpacePagerView.swift */,
 				8E86CD4BDC2CDD375D06AC94 /* SpaceView.swift */,
 				CDA3E541FA1E22277EC2F5D7 /* TidyBannerView.swift */,
@@ -360,6 +364,7 @@
 			isa = PBXGroup;
 			children = (
 				F353736C12155A33A552DA26 /* Models.swift */,
+				93894CA1F741852EE27189B3 /* SpaceGradient.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -368,7 +373,6 @@
 			isa = PBXGroup;
 			children = (
 				703A568EADEF671A2FEDCD2C /* ZenColorWheel.swift */,
-				4E7B9E83E5CF1E7AF343E205 /* ZenGradientModel.swift */,
 				81B1BF33203E7A384A732526 /* ZenGradientPicker.swift */,
 				EBE67D86646FA000A8B136C0 /* ZenGradientRenderer.swift */,
 				71A589F2CB5E059B6BF8702C /* ZenGrainDial.swift */,
@@ -385,7 +389,7 @@
 			path = NoteSheet;
 			sourceTree = "<group>";
 		};
-		"TEMP_871E3FF4-AEE8-4B8A-958F-EA87751E91A2" /* Resources */ = {
+		"TEMP_FFD1A3B6-EB3C-4662-B000-79A7916EF85E" /* Resources */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -562,7 +566,9 @@
 				E3B6DAA540F1126C1C0E9487 /* SavantApp.swift in Sources */,
 				A48F01A55F416D5A2291E1C1 /* SearchSheet.swift in Sources */,
 				785D88819CD66481952F966B /* SettingsSheet.swift in Sources */,
+				ADF5A73E9B2636BC3E7B7C36 /* SpaceGradient.swift in Sources */,
 				8183BE8DD7EDF083D41D8F02 /* SpaceHeaderView.swift in Sources */,
+				168D78BB58DDF252260D6268 /* SpaceMesh.swift in Sources */,
 				199C1A0644C0DA48369EBB7D /* SpacePagerView.swift in Sources */,
 				CCA35E6BCC8A5680762E3696 /* SpaceSwitcherSheet.swift in Sources */,
 				E5EFFC26941F3B02D9EEA807 /* SpaceView.swift in Sources */,
@@ -599,9 +605,9 @@
 				C5638E020995B8E7677CE94C /* Models.swift in Sources */,
 				DB35F7786E6B019BB616FE77 /* PersistenceController.swift in Sources */,
 				758C01920B0DE21C264CD7BD /* SavantApp.swift in Sources */,
+				9E2A6FFBC81AC736E11D3AB4 /* SpaceGradient.swift in Sources */,
 				223A628E1F6BE6B8F33AE875 /* View+HoverTracking.swift in Sources */,
 				8A105730B5D5C390B98CB8C7 /* ZenColorWheel.swift in Sources */,
-				F694232A8F25F2C74E26B65E /* ZenGradientModel.swift in Sources */,
 				006B647472F41EFB03A6E339 /* ZenGradientPicker.swift in Sources */,
 				0937AE429233FF1932BFA0FD /* ZenGradientRenderer.swift in Sources */,
 				ED57E2990513FED8CA61EEF4 /* ZenGrainDial.swift in Sources */,

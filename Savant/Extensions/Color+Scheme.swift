@@ -2,6 +2,9 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 #endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 extension Color {
     init(hex: String) {
@@ -115,6 +118,65 @@ extension Color {
             // Near-white wash that keeps a faint space tint (~20%).
             return mixed(with: .white, by: 0.80)
         }
+    }
+    #endif
+
+    #if canImport(UIKit)
+    /// Linearly interpolates between two colors in sRGB. `t` is clamped to [0, 1].
+    func mixed(with other: Color, by t: CGFloat) -> Color {
+        let t = max(0, min(1, t))
+        let a = UIColor(self), b = UIColor(other)
+        var ar: CGFloat = 0, ag: CGFloat = 0, ab: CGFloat = 0, aa: CGFloat = 0
+        var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+        a.getRed(&ar, green: &ag, blue: &ab, alpha: &aa)
+        b.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+        return Color(.sRGB,
+                     red: Double(ar * (1 - t) + br * t),
+                     green: Double(ag * (1 - t) + bg * t),
+                     blue: Double(ab * (1 - t) + bb * t),
+                     opacity: Double(aa * (1 - t) + ba * t))
+    }
+
+    /// WCAG relative luminance in [0, 1]. Used to choose readable ink over an
+    /// arbitrary space-color fill (pale pastels vs dark-mode tones).
+    var relativeLuminance: Double {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        func lin(_ v: CGFloat) -> Double {
+            let v = Double(v)
+            return v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+
+    /// Readable near-black / white ink for content drawn on a fill of `self`.
+    var selectionInk: Color {
+        let lum = relativeLuminance
+        let contrastWhite = 1.05 / (lum + 0.05)
+        let contrastBlack = (lum + 0.05) / 0.05
+        return contrastBlack >= contrastWhite ? Color.black.opacity(0.85) : .white
+    }
+
+    /// Multiplicatively nudges the color in HSB space — used to derive related
+    /// mesh stops (lighter/deeper/hue-shifted) from a single space color.
+    func adjusted(hue hFactor: CGFloat = 1, saturation sFactor: CGFloat = 1,
+                  brightness bFactor: CGFloat = 1) -> Color {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Color(hue: Double((h * hFactor).truncatingRemainder(dividingBy: 1)),
+                     saturation: Double(min(1, max(0, s * sFactor))),
+                     brightness: Double(min(1, max(0, b * bFactor))),
+                     opacity: Double(a))
+    }
+
+    /// Shifts hue by an absolute number of degrees (keeps S/B). Wraps around.
+    func hueShifted(by degrees: Double) -> Color {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        var newHue = Double(h) + degrees / 360
+        newHue = newHue.truncatingRemainder(dividingBy: 1)
+        if newHue < 0 { newHue += 1 }
+        return Color(hue: newHue, saturation: Double(s), brightness: Double(b), opacity: Double(a))
     }
     #endif
 }

@@ -4,7 +4,6 @@ import SwiftUI
 struct SpacePagerView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
-    @Environment(\.colorScheme) private var colorScheme
 
     @Query(sort: \Space.sortIndex) private var spaces: [Space]
     @Query(sort: \Note.createdAt) private var notes: [Note]
@@ -18,9 +17,16 @@ struct SpacePagerView: View {
         @Bindable var appState = appState
 
         ZStack(alignment: .bottom) {
-            currentBackground
-                .ignoresSafeArea()
-                .animation(.easeInOut(duration: 0.24), value: appState.selectedSpaceID)
+            Group {
+                if let currentSpace {
+                    SpaceMeshBackground(space: currentSpace)
+                        .id(currentSpace.id)
+                        .transition(.opacity)
+                } else {
+                    Color(hex: "#C8D5C0").ignoresSafeArea()
+                }
+            }
+            .animation(.easeInOut(duration: 0.4), value: appState.selectedSpaceID)
 
             if spaces.isEmpty {
                 EmptyWorkspaceView()
@@ -75,15 +81,6 @@ struct SpacePagerView: View {
     private var selectedIndex: Int {
         guard let currentSpace else { return 0 }
         return spaces.firstIndex(where: { $0.id == currentSpace.id }) ?? 0
-    }
-
-    private var currentBackground: Color {
-        guard let currentSpace else { return Color(hex: "#C8D5C0") }
-        return Color.spaceColor(
-            lightHex: currentSpace.colorHex,
-            darkHex: currentSpace.darkColorHex,
-            scheme: colorScheme
-        )
     }
 
     private var latestVisibleRun: TidyRun? {

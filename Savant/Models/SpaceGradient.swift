@@ -2,14 +2,18 @@ import CoreGraphics
 import Foundation
 import SwiftUI
 
-#if os(macOS)
-
 // MARK: - Color stop
 
 /// The single user-controlled point on the wheel. Hue = angle around
 /// center, saturation = normalized distance from center (clamped to the
 /// SafeColor range). Lightness is global on the config so every derived
 /// color stays in the safe band regardless of how the satellites spread.
+///
+/// This whole color model is pure Swift (no AppKit/UIKit) and lives in
+/// `Models/` so BOTH the macOS shell and the iOS app share one space
+/// identity — the iOS app renders it as a `MeshGradient`, macOS as a
+/// tinted wash. The platform-specific *renderers* + pickers stay in their
+/// own folders; only the math is shared here.
 struct ZenColorStop: Equatable, Codable {
     var hue: Double          // 0…360
     var saturation: Double   // clamped to SafeColor.minSaturation…maxSaturation
@@ -228,6 +232,17 @@ struct ZenColorPreset: Identifiable, Equatable {
         self.intensity = intensity
         self.stopCount = stopCount
     }
+
+    /// A ready-to-store config built from this preset.
+    var config: ZenGradientConfig {
+        ZenGradientConfig(
+            primary: ZenColorStop(hue: hue, saturation: saturation),
+            stopCount: stopCount,
+            intensity: intensity,
+            grain: 0,
+            previewScheme: .system
+        )
+    }
 }
 
 /// Combined palette: cuicui-inspired multi-stop spreads + Cift's
@@ -341,5 +356,3 @@ extension Space {
         return ZenGradientConfig.decode(data)
     }
 }
-
-#endif
