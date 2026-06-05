@@ -109,13 +109,83 @@ struct FolderService {
         try context.save()
     }
 
-    func changeTier(_ folder: Folder, to tier: NoteTier) throws {
-        let folderID = folder.id
-        folder.tier = tier
-        let descriptor = FetchDescriptor<Note>(predicate: #Predicate { $0.folder?.id == folderID })
-        for note in try context.fetch(descriptor) {
-            note.tier = tier
+    /// Unify a tier's top-level ordering so standalone notes (`manualSortIndex`)
+    /// and top-level folders (`sortIndex`) share ONE 0..n counter — letting them
+    /// interleave in the flat sidebar list. Detects the legacy dual-index state
+    /// (value collisions or nil note indices) and migrates it folders-first;
+    /// once unified it preserves the existing order. Also renumbers each folder's
+    /// child folders + member notes into their own per-container counters.
+    func normalizeTierOrder(tier: NoteTier, in space: Space) throws {
+        let spaceID = space.id
+        let folders = (try context.fetch(FetchDescriptor<Folder>(predicate: #Predicate {
+            $0.space?.id == spaceID
+        }))).filter { $0.tier == tier && $0.parent == nil }
+        let notes = (try context.fetch(FetchDescriptor<Note>(predicate: #Predicate {
+            $0.space?.id == spaceID
+        }))).filter { $0.tier == tier && $0.folder == nil }
+
+        var changed = false
+        normalizeContainer(folders: folders, notes: notes, changed: &changed)
+        if changed { try context.save() }
+    }
+
+    /// Assign ONE shared 0..n order counter across a container's child folders
+    /// (`sortIndex`) AND member notes (`manualSortIndex`) so they interleave —
+    /// e.g. a note can sit above a sub-folder. Migrates the legacy dual-index
+    /// state folders-first; once unified, preserves order. Recurses into each
+    /// child folder.
+    private func normalizeContainer(folders: [Folder], notes: [Note], changed: inout Bool) {
+        enum Item { case folder(Folder); case note(Note) }
+        func key(_ i: Item) -> Int {
+            switch i {
+            case .folder(let f): return f.sortIndex
+            case .note(let n): return n.manualSortIndex ?? Int.max
+            }
         }
+        func created(_ i: Item) -> Date {
+            switch i {
+            case .folder(let f): return f.createdAt
+            case .note(let n): return n.createdAt
+            }
+        }
+        let vals = folders.map { $0.sortIndex } + notes.map { $0.manualSortIndex ?? Int.max }
+        let unified = Set(vals).count == vals.count && !notes.contains { $0.manualSortIndex == nil }
+
+        let ordered: [Item]
+        if unified {
+            ordered = (folders.map { Item.folder($0) } + notes.map { Item.note($0) })
+                .sorted { key($0) != key($1) ? key($0) < key($1) : created($0) < created($1) }
+        } else {
+            // Legacy dual-index → migrate folders-first within the container.
+            let f = folders.sorted { $0.sortIndex != $1.sortIndex ? $0.sortIndex < $1.sortIndex : $0.createdAt < $1.createdAt }
+            let n = notes.sorted {
+                let a = $0.manualSortIndex ?? Int.max, b = $1.manualSortIndex ?? Int.max
+                return a != b ? a < b : $0.createdAt < $1.createdAt
+            }
+            ordered = f.map { Item.folder($0) } + n.map { Item.note($0) }
+        }
+
+        for (i, item) in ordered.enumerated() {
+            switch item {
+            case .folder(let f): if f.sortIndex != i { f.sortIndex = i; changed = true }
+            case .note(let n): if n.manualSortIndex != i { n.manualSortIndex = i; changed = true }
+            }
+        }
+        for f in folders {
+            normalizeContainer(folders: f.children ?? [], notes: f.notes ?? [], changed: &changed)
+        }
+    }
+
+    /// Move a folder's whole subtree (the folder, its member notes, and every
+    /// descendant folder + their notes) to `tier`.
+    func changeTier(_ folder: Folder, to tier: NoteTier) throws {
+        applyTier(folder, tier)
         try context.save()
+    }
+
+    private func applyTier(_ folder: Folder, _ tier: NoteTier) {
+        folder.tier = tier
+        for n in (folder.notes ?? []) { n.tier = tier }
+        for c in (folder.children ?? []) { applyTier(c, tier) }
     }
 }

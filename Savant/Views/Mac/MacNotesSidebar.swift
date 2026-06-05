@@ -69,7 +69,7 @@ final class NoteSelectionModel {
 
 /// Batch operations available from the multi-select context menu.
 enum NoteBatchAction {
-    case pin, makeEssential, moveToNotes, duplicate, archive, delete, openSplit
+    case pin, makeEssential, moveToNotes, duplicate, archive, delete, openSplit, group
 }
 
 /// Which edge of the editor a note is being dragged toward → the split layout.
@@ -234,6 +234,11 @@ struct MacNotesSidebar: View {
             return
         }
 
+        if action == .group {
+            createFolder(from: targets, in: space)
+            return
+        }
+
         let service = NoteService(context: modelContext)
         for note in targets {
             switch action {
@@ -242,10 +247,44 @@ struct MacNotesSidebar: View {
             case .moveToNotes: try? service.promote(note, to: .random, currentSpace: space)
             case .archive: try? service.archive(note)
             case .duplicate: _ = try? service.duplicate(note)
-            case .delete, .openSplit: break
+            case .delete, .openSplit, .group: break
             }
         }
         selection.clear()
+    }
+
+    /// Create a new folder from a multi-selection: the selected notes reflow
+    /// into a fresh folder (placed roughly where the selection was), which opens
+    /// in inline-rename. Notes from other tiers are pulled into the folder's tier.
+    private func createFolder(from targets: [Note], in space: Space) {
+        guard !targets.isEmpty else { return }
+        func rank(_ t: NoteTier) -> Int {
+            switch t { case .pinned: return 0; case .random: return 1; case .favorite: return 2; case .archived: return 3 }
+        }
+        let ordered = targets.sorted { a, b in
+            let ra = rank(a.tier), rb = rank(b.tier)
+            return ra == rb ? noteSort(a, b) : ra < rb
+        }
+        let anchor = ordered[0]
+        let folderTier: NoteTier = (anchor.tier == .pinned || anchor.tier == .random) ? anchor.tier : .pinned
+        let svc = FolderService(context: modelContext)
+
+        let newFolder: Folder? = withAnimation(.smooth(duration: 0.24)) {
+            guard let folder = try? svc.create(in: space, tier: folderTier, parent: nil) else { return nil }
+            // Take the anchor's top-level slot so the folder forms in place.
+            if anchor.tier == folderTier, anchor.folder == nil, let idx = anchor.manualSortIndex {
+                folder.sortIndex = idx
+            }
+            for (i, note) in ordered.enumerated() {
+                try? svc.moveNote(note, into: folder)
+                note.manualSortIndex = i
+            }
+            try? svc.normalizeTierOrder(tier: folderTier, in: space)
+            return folder
+        }
+        guard let folder = newFolder else { return }
+        selection.clear()
+        renamingFolderID = folder.id
     }
 
     private func commitBatchDelete() {
@@ -376,6 +415,9 @@ struct MacNotesSidebar: View {
                     pendingPrimary: (id == pendingSplitPrimaryID)
                         ? notes.first(where: { $0.id == id }) : nil
                 )
+            } else if let fid = session.draggedFolderID,
+                      let folder = folders.first(where: { $0.id == fid }) {
+                MacSidebarFolderGhost(folder: folder, session: session, activeSpace: selectedSpace)
             }
         }
         // Shared coord space across the anchored Essentials and the per-
@@ -680,6 +722,62 @@ private struct MacSpacePageClipShape: Shape {
     }
 }
 
+/// Floating ghost for a dragged folder header — a collapsed folder pill that
+/// tracks the cursor via the shared `sourceRowCenter` + `translation`.
+private struct MacSidebarFolderGhost: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let folder: Folder
+    let session: CrossTierDragSession
+    let activeSpace: Space?
+
+    private var tint: Color {
+        guard let s = activeSpace else { return .accentColor }
+        return Color.spaceColor(lightHex: s.colorHex, darkHex: s.darkColorHex, scheme: colorScheme)
+    }
+    private var rowWidth: CGFloat {
+        session.tierFrames[session.sourceTier ?? .random]?.width
+            ?? session.tierFrames[.random]?.width
+            ?? session.tierFrames[.pinned]?.width
+            ?? 220
+    }
+    private var count: Int { (folder.notes?.count ?? 0) + (folder.children?.count ?? 0) }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 22)
+                .foregroundStyle(.secondary)
+            Text(folder.name)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Text("\(count)")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 8)
+        .frame(width: max(0, rowWidth - CGFloat(session.draggedRowDepth) * 14), height: 32)
+        .background(
+            Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.6 : 0.85),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(tint.opacity(0.35), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(session.isSettling ? 0 : 0.18),
+                radius: session.isSettling ? 0 : 8, x: 0, y: session.isSettling ? 0 : 4)
+        .frame(width: rowWidth, alignment: .trailing)
+        .animation(.smooth(duration: 0.16), value: session.draggedRowDepth)
+        .position(
+            x: session.sourceRowCenter.x + session.translation.width,
+            y: session.sourceRowCenter.y + session.translation.height
+        )
+        .allowsHitTesting(false)
+    }
+}
+
 private struct MacSidebarFloatingGhost: View {
     @Environment(\.colorScheme) private var colorScheme
 
@@ -882,7 +980,12 @@ private struct MacSidebarFloatingGhost: View {
     }
 
     private var rowGhost: some View {
-        HStack(spacing: 9) {
+        // Inset + narrow to match a folder member's tab; right-aligned within
+        // the full tier width so the pill sits exactly where the real member
+        // row renders (which is left-inset, trailing edge unchanged). Animates
+        // as the previewed depth changes while dragging in/out of folders.
+        let inset = CGFloat(session.draggedRowDepth) * 14
+        return HStack(spacing: 9) {
             Text(note.title)
                 .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
                 .lineLimit(1)
@@ -892,24 +995,32 @@ private struct MacSidebarFloatingGhost: View {
         }
         .padding(.leading, 12)
         .padding(.trailing, 8)
-        .frame(width: rowWidth, height: 32)
+        .frame(width: max(0, rowWidth - inset), height: 32)
         .background(
             isSelected
             ? selectionFill
             : Color(nsColor: .windowBackgroundColor).opacity(colorScheme == .dark ? 0.55 : 0.78),
             in: RoundedRectangle(cornerRadius: 9, style: .continuous)
         )
+        .frame(width: rowWidth, alignment: .trailing)
+        .animation(.smooth(duration: 0.16), value: session.draggedRowDepth)
     }
 
     /// Multi-drag ghost: the dragged group rendered as a contiguous stack of
     /// real selected rows (same 35pt pitch as the list), so it reads as the
     /// rows "reuniting" and moving together rather than a single proxy.
     private var multiRowStack: some View {
-        VStack(spacing: 3) {
+        // Inset the whole stack to the resolved depth so the selection visibly
+        // indents/outdents as you steer it in/out of folders.
+        let inset = CGFloat(session.draggedRowDepth) * 14
+        return VStack(spacing: 3) {
             ForEach(draggedNotes, id: \.id) { n in
                 selectedGhostRow(for: n)
             }
         }
+        .frame(width: max(0, rowWidth - inset))
+        .frame(width: rowWidth, alignment: .trailing)
+        .animation(.smooth(duration: 0.16), value: session.draggedRowDepth)
     }
 
     private func selectedGhostRow(for note: Note) -> some View {
@@ -922,7 +1033,8 @@ private struct MacSidebarFloatingGhost: View {
         }
         .padding(.leading, 12)
         .padding(.trailing, 8)
-        .frame(width: rowWidth, height: 32)
+        .frame(maxWidth: .infinity)
+        .frame(height: 32)
         .background(selectionFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
@@ -1450,6 +1562,7 @@ private struct MacSpaceNotesColumn: View {
                 isRenaming: $isRenamingSpace,
                 draftName: $draftName,
                 onCommitRename: commitRename,
+                isDropTarget: spaceIsDropTarget,
                 menuItems: { spaceMenuItems() }
             )
             .padding(.horizontal, 8)
@@ -1635,6 +1748,18 @@ private struct MacSpaceNotesColumn: View {
 
     private var contentWidth: CGFloat {
         max(0, columnWidth - contentLeadingInset - contentTrailingInset)
+    }
+
+    /// A within-tier tab drag (note or folder) is resolving to the TOP LEVEL
+    /// (depth 0, no folder) → highlight the space name as the drop target,
+    /// mirroring how a folder lights up when you nest.
+    private var spaceIsDropTarget: Bool {
+        isActiveSpace
+            && session.isActive
+            && session.nestTargetFolderID == nil
+            && session.draggedRowDepth == 0
+            && session.currentTier == session.sourceTier
+            && (session.sourceTier == .pinned || session.sourceTier == .random)
     }
 
     /// Only changes during drag/cross-tier transitions, NOT on commit. The
@@ -2887,6 +3012,34 @@ private struct MacEssentialsRow: View {
 final class CrossTierDragSession {
     // Source identity
     var draggedNoteID: UUID? = nil
+    /// Set when dragging a FOLDER header (instead of a note). The folder is
+    /// genuinely collapsed for the drag and reorders among its tier's top-level
+    /// items; never promotable to Essentials.
+    var draggedFolderID: UUID? = nil
+    /// Whether the dragged folder was expanded before the grab, so it can be
+    /// re-opened (as a separate clean animation) once the drag settles.
+    @ObservationIgnored var draggedFolderWasExpanded = false
+    /// The source tier's RESTING flat rows (the tier MINUS the dragged row),
+    /// published at drag start. The hit-test resolves the drop slot against this
+    /// fixed layout (via the ghost center) so it never oscillates, and treats
+    /// folder headers as nest bands. `folderID` = the folder to nest into (for a
+    /// header row) or the row's membership (for a note row).
+    @ObservationIgnored var tierFolderRows: [NoteTier: [(isFolder: Bool, folderID: UUID?, depth: Int)]] = [:]
+    /// The resolved PARENT folder for the dragged note (indent model): nil =
+    /// top-level, else the folder it will nest into at the current depth. Drives
+    /// the folder highlight + the commit's membership.
+    var nestTargetFolderID: UUID? = nil
+    /// Cursor X (notes-column coords) at grab + the dragged row's depth at grab,
+    /// so the live depth is steered relative to where you started.
+    @ObservationIgnored var dragStartCursorX: CGFloat = 0
+    @ObservationIgnored var dragSourceDepth: Int = 0
+    /// Max depth the dragged item may reach: a note can be one deeper than the
+    /// deepest folder; a dragged folder is limited so its deepest descendant
+    /// still fits under `Folder.maxDepth`.
+    @ObservationIgnored var draggedDepthCap: Int = 0
+    /// Live center of the indent drop indicator (notes-column coords) — the
+    /// ghost settles exactly here so the release lands where the bar shows.
+    @ObservationIgnored var dropIndicatorCenter: CGPoint? = nil
     var sourceTier: NoteTier? = nil
     var sourceIndex: Int = 0
     var sourceRowCenter: CGPoint = .zero
@@ -2978,6 +3131,12 @@ final class CrossTierDragSession {
     /// Measured width of the dragged Essentials tile at pickup (combined split
     /// tile = 2 columns), so the floating ghost matches it exactly.
     @ObservationIgnored var draggedTileWidth: CGFloat? = nil
+
+    /// Folder nesting depth the dragged row PREVIEWS at (0 = standalone,
+    /// 1 = inside a top-level folder, …). Updated live from the drop slot so the
+    /// floating row ghost insets/narrows to match a member tab as it moves
+    /// in/out of folders.
+    var draggedRowDepth: Int = 0
     var favoriteDropZoneVisible: Bool = false
     var showsAddToEssentialsBanner: Bool = false
 
@@ -3060,7 +3219,7 @@ final class CrossTierDragSession {
     // and the sidebar's collapse can run in parallel.
     @ObservationIgnored var essentialsSectionHeight: CGFloat = 0
 
-    var isActive: Bool { draggedNoteID != nil }
+    var isActive: Bool { draggedNoteID != nil || draggedFolderID != nil }
 
     var isCrossTier: Bool {
         guard let s = sourceTier, let c = currentTier else { return false }
@@ -3188,13 +3347,17 @@ final class CrossTierDragSession {
             }
         }
 
-        let newTier = bestTier ?? sourceTier
+        var newTier = bestTier ?? sourceTier
+        // Folders can't promote to Essentials — clamp a folder drag back to its
+        // source (list) tier when the cursor wanders over the favorites grid.
+        if draggedFolderID != nil, newTier == .favorite { newTier = sourceTier }
         guard let target = newTier else { return }
 
         let frame = tierFrames[target] ?? .zero
         let baseCount = noteCountsByTier[target] ?? 0
         let effective = target == sourceTier ? max(1, baseCount) : (baseCount + 1)
 
+        var resolvedDepth = 0
         let newIndex: Int
         if target == .favorite, frame.width > 0, !favoriteEntryLayout.isEmpty {
             // Span-aware flow hit-test: lay out the resting entries (singles =
@@ -3234,18 +3397,50 @@ final class CrossTierDragSession {
             let proposed = row * N + col
             newIndex = min(max(0, proposed), max(0, effective - 1))
         } else {
-            let yInTier = max(0, y - frame.minY)
-            let raw = Int((yInTier / rowHeight).rounded(.down))
-            newIndex = min(max(0, raw), max(0, effective - 1))
+            let restInfo = tierFolderRows[target] ?? []
+            // Single note, folder, OR a multi-note selection all resolve to one
+            // (gap, depth) via the indent model.
+            let withinTier = target == sourceTier
+                && (draggedNoteID != nil || draggedFolderID != nil)
+            if withinTier {
+                // Indent / horizontal model (file-tree style). VERTICAL (ghost
+                // center) picks the insertion gap; HORIZONTAL (cursor delta from
+                // grab) picks the depth, clamped to the legal [minDepth,maxDepth]
+                // for that gap so the tree stays valid. `restInfo` is the tier
+                // MINUS the dragged row, so positions are fixed (no feedback).
+                let ghostY = sourceRowCenter.y + translation.height
+                let m = restInfo.count
+                // Nearest gap to the ghost (a note inserted at gap g renders at
+                // index g → center = minY + g*rowHeight + rowHeight/2).
+                let g = min(max(0, Int(((ghostY - frame.minY - rowHeight / 2) / rowHeight).rounded())), m)
+                let prev = g > 0 ? restInfo[g - 1] : nil
+                let next = g < m ? restInfo[g] : nil
+                let minD = next?.depth ?? 0
+                var maxD = prev == nil ? 0 : (prev!.isFolder ? prev!.depth + 1 : prev!.depth)
+                maxD = max(minD, min(maxD, draggedDepthCap))
+                let dx = (cursorX ?? dragStartCursorX) - dragStartCursorX
+                let steps = Int((dx / 22).rounded())
+                let d = max(minD, min(maxD, dragSourceDepth + steps))
+                newIndex = g
+                resolvedDepth = d
+            } else {
+                let yInTier = max(0, y - frame.minY)
+                let raw = Int((yInTier / rowHeight).rounded(.down))
+                newIndex = min(max(0, raw), max(0, effective - 1))
+            }
         }
 
-        if currentTier != target || currentIndex != newIndex {
+        let depthChanged = target == sourceTier && draggedRowDepth != resolvedDepth
+        if currentTier != target || currentIndex != newIndex || depthChanged {
             let tierChanged = currentTier != target
             currentTier = target
             currentIndex = newIndex
-            // Trackpad detent each time the drop target moves during the drag
-            // (not the release snap). Row changes get a subtle tick; crossing
-            // into a new tier gets a heavier one to highlight the boundary.
+            // Within-tier: the resolver drives the ghost indent; cross-tier the
+            // note is standalone (depth 0). The PARENT folder (membership) is
+            // computed view-side from `currentIndex` + this depth.
+            draggedRowDepth = (target == sourceTier) ? resolvedDepth : 0
+            // Trackpad detent when the drop target moves (discrete — fires once
+            // per row/folder/depth crossing, not per frame). Heavier across tiers.
             playDragDetent(tierChanged: tierChanged)
         }
     }
@@ -3270,7 +3465,8 @@ final class CrossTierDragSession {
     func scheduleWatchdog(for id: UUID?, generation: Int) {
         guard let id else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, self.draggedNoteID == id, self.dragGeneration == generation else { return }
+            guard let self, (self.draggedNoteID == id || self.draggedFolderID == id),
+                  self.dragGeneration == generation else { return }
             var tx = Transaction()
             tx.disablesAnimations = true
             withTransaction(tx) { self.reset() }
@@ -3291,6 +3487,10 @@ final class CrossTierDragSession {
         frozenTileWidth = nil
         frozenAsTile = nil
         draggedTileWidth = nil
+        draggedRowDepth = 0
+        draggedFolderID = nil
+        nestTargetFolderID = nil
+        dropIndicatorCenter = nil
         isSettling = false
         sourceSpaceID = nil
         editorDropSide = nil
@@ -3316,10 +3516,19 @@ private struct MacSpaceHeaderView<MenuItems: View>: View {
     @Binding var isRenaming: Bool
     @Binding var draftName: String
     let onCommitRename: () -> Void
+    /// A dragged tab is targeting the top level (no folder) → the space name
+    /// lights up like hover, to show "this is where it'll land."
+    var isDropTarget: Bool = false
     @ViewBuilder var menuItems: () -> MenuItems
 
     @State private var isHovering = false
     @FocusState private var renameFocused: Bool
+
+    private var spaceHeaderFill: Color {
+        if isDropTarget { return Color.primary.opacity(colorScheme == .dark ? 0.18 : 0.12) }
+        if isHovering && !isRenaming { return Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06) }
+        return .clear
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -3367,9 +3576,7 @@ private struct MacSpaceHeaderView<MenuItems: View>: View {
         .frame(height: 30)
         .background {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isHovering && !isRenaming
-                      ? Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06)
-                      : Color.clear)
+                .fill(spaceHeaderFill)
         }
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
@@ -3377,7 +3584,8 @@ private struct MacSpaceHeaderView<MenuItems: View>: View {
         .onChange(of: isRenaming) { _, now in
             if now { renameFocused = true }
         }
-        .animation(.easeOut(duration: 0.1), value: isHovering)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .animation(.smooth(duration: 0.14), value: isDropTarget)
     }
 }
 
@@ -3426,76 +3634,10 @@ private struct MacSidebarGroup: View {
     private var isCurrentTier: Bool { session.currentTier == tier }
 
     var body: some View {
-        LazyVStack(spacing: 3) {
-            ForEach(folders) { folder in
-                MacFolderRow(folder: folder, space: space, selectedNoteID: selectedNoteID, selectNote: selectNote, selection: selection, performBatch: performBatch, openInSplit: openInSplit, addToSplit: addToSplit, renamingFolderID: $renamingFolderID)
-            }
-
-            ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
-                // Multi-drag: every dragged row collapses out of flow wherever
-                // it lives. Single-drag: only the one grabbed row, and only
-                // when it has crossed into another tier.
-                let isSource = session.isMulti
-                    ? session.isDragged(note.id)
-                    : (session.draggedNoteID == note.id && isSourceTier)
-                let collapse = session.isMulti
-                    ? isSource
-                    : (isSource && session.isCrossTier)
-
-                Group {
-                    // The split primary's slot renders the combined pill (the
-                    // secondary is hidden from the list); it drags through the
-                    // same engine as a normal row.
-                    if let splitPair = splitPairs.first(where: { $0.anchorID == note.id }) {
-                        MacSplitTabRow(
-                            primary: splitPair.primary,
-                            secondary: splitPair.secondary,
-                            onSelect: { selectNote(splitPair.primary) },
-                            onSeparate: { dissolveSplit(splitPair.primary.id, tier, space) },
-                            isFocused: selectedNoteID == splitPair.primary.id
-                                || selectedNoteID == splitPair.secondary.id,
-                            tint: spaceColor
-                        )
-                    } else if note.id == pendingSplitPrimaryID {
-                        // Add-to-Split pending: pill with an empty second slot
-                        // until a note is picked or created.
-                        MacSplitTabRow(
-                            primary: note,
-                            secondary: nil,
-                            onSelect: { selectNote(note) },
-                            isFocused: true,
-                            onCancelPending: cancelPendingSplit,
-                            tint: spaceColor
-                        )
-                    } else {
-                        MacNoteRow(
-                            note: note,
-                            space: space,
-                            isSelected: selectedNoteID == note.id,
-                            showDropIndicator: false,
-                            indicatorColor: spaceColor,
-                            selectNote: selectNote,
-                            selection: selection,
-                            performBatch: performBatch,
-                            openInSplit: openInSplit,
-                            addToSplit: addToSplit,
-                            orderedIDs: orderedNoteIDs
-                        )
-                    }
-                }
-                // The host note keeps the same model ID while its row changes
-                // from single → pending → formed split. Give LazyVStack an
-                // explicit presentation identity so it replaces the row
-                // immediately instead of waiting for a later drag invalidation.
-                .id(tabPresentationID(for: note))
-                // Source row collapses out of layout when the cursor has
-                // moved into another tier (so this tier's rows close the
-                // gap). Within-tier, slot is preserved so the unified offset
-                // formula can shift siblings around it.
-                .opacity(isSource ? 0 : 1)
-                .frame(height: collapse ? 0 : nil)
-                .offset(y: offset(forIndex: index))
-                .simultaneousGesture(liveDragGesture(for: note, at: index))
+        let rows = displayedFlatRows
+        return LazyVStack(spacing: 3) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                flatRowView(row, at: index)
             }
             // Gate on `isActive`: during a drag this animates the live
             // reshuffle, but `.animation(value:)` is transaction-independent
@@ -3520,7 +3662,8 @@ private struct MacSidebarGroup: View {
         }
         .onAppear {
             if isActiveSpace {
-                session.noteCountsByTier[tier] = notes.count
+                try? FolderService(context: modelContext).normalizeTierOrder(tier: tier, in: space)
+                session.noteCountsByTier[tier] = flatRows.count
                 session.dropSpace = space
                 // If we already have a measured frame, push it now —
                 // covers the case where geometry was reported before
@@ -3530,16 +3673,20 @@ private struct MacSidebarGroup: View {
                 }
             }
         }
-        .onChange(of: notes.count) { _, newValue in
+        .onChange(of: flatRows.count) { _, newValue in
             if isActiveSpace { session.noteCountsByTier[tier] = newValue }
         }
+        .onAppear { publishTierRows() }
+        .onChange(of: tierRowsKey) { _, _ in publishTierRows() }
         .onChange(of: isActiveSpace) { _, newValue in
             // When this column becomes the active one (after a swipe, edge
             // auto-switch, or the first time `selectedSpaceID` resolves),
             // refresh its frames/counts and mark it as the live drop space.
             if newValue {
-                session.noteCountsByTier[tier] = notes.count
+                try? FolderService(context: modelContext).normalizeTierOrder(tier: tier, in: space)
+                session.noteCountsByTier[tier] = flatRows.count
                 session.dropSpace = space
+                publishTierRows()
                 if lastMeasuredFrame.height > 0 {
                     session.tierFrames[tier] = lastMeasuredFrame
                 }
@@ -3547,12 +3694,35 @@ private struct MacSidebarGroup: View {
         }
     }
 
+    /// Publish this tier's resting rows (minus any dragged items that belong to
+    /// it) so the hit-test/commit can resolve drops in EITHER tier — including a
+    /// cross-tier folder move landing positionally in the destination.
+    private func publishTierRows() {
+        guard isActiveSpace else { return }
+        var dragged = Set(session.draggedNoteIDs)
+        if let fid = session.draggedFolderID { dragged.insert(fid) }
+        session.tierFolderRows[tier] = flatRows
+            .filter { !dragged.contains($0.rowID) }
+            .map { (isFolder: $0.isFolder,
+                    folderID: $0.isFolder ? $0.rowID : $0.folderID,
+                    depth: $0.depth) }
+    }
+
+    private var tierRowsKey: String {
+        var dragged = session.draggedNoteIDs.map(\.uuidString)
+        if let fid = session.draggedFolderID { dragged.append(fid.uuidString) }
+        let rows = flatRows.map { ($0.isFolder ? "F" : "n") + $0.rowID.uuidString.prefix(4) }.joined()
+        return dragged.joined() + "|" + rows
+    }
+
     /// Single value that captures any state change that should re-trigger
     /// the row-shuffle animation. Used as the `value:` for `.animation(...)`.
     private var dragSignature: String {
         let st = session.sourceTier?.rawValue ?? "_"
         let ct = session.currentTier?.rawValue ?? "_"
-        return "\(st)|\(session.sourceIndex)|\(ct)|\(session.currentIndex)"
+        // Include depth + nest target so the indent indicator animates as the
+        // horizontal/depth resolution changes.
+        return "\(st)|\(session.sourceIndex)|\(ct)|\(session.currentIndex)|\(session.draggedRowDepth)|\(session.nestTargetFolderID?.uuidString ?? "_")"
     }
 
     private func tabPresentationID(for note: Note) -> String {
@@ -3563,6 +3733,229 @@ private struct MacSidebarGroup: View {
             return "\(note.id.uuidString)|pending"
         }
         return "\(note.id.uuidString)|single"
+    }
+
+    // MARK: - Flat entry list (folder headers + notes interleaved)
+
+    private static let folderIndentStep: CGFloat = 14
+
+    struct SidebarRow: Identifiable {
+        enum Kind { case folderHeader(Folder); case note(Note) }
+        let kind: Kind
+        let depth: Int
+        let folderID: UUID?   // membership of a note row (nil = standalone)
+        var rowID: UUID {
+            switch kind { case .folderHeader(let f): return f.id; case .note(let n): return n.id }
+        }
+        var isFolder: Bool { if case .folderHeader = kind { return true }; return false }
+        var id: String {
+            switch kind {
+            case .folderHeader(let f): return "folder-\(f.id.uuidString)"
+            case .note(let n): return "note-\(n.id.uuidString)"
+            }
+        }
+    }
+
+    /// The tier rendered as ONE flat list: top-level folders + standalone notes
+    /// interleaved by their shared order counter, each expanded folder followed
+    /// by its child folders + member notes (indented). Every row is the same
+    /// 35pt pitch so the uniform-row drag engine indexes it directly.
+    var flatRows: [SidebarRow] {
+        enum Top { case folder(Folder); case note(Note) }
+        func createdAt(_ t: Top) -> Date {
+            switch t { case .folder(let f): return f.createdAt; case .note(let n): return n.createdAt }
+        }
+        func order(_ t: Top) -> Int {
+            switch t { case .folder(let f): return f.sortIndex; case .note(let n): return n.manualSortIndex ?? Int.max }
+        }
+        var top: [Top] = folders.map { .folder($0) } + notes.map { .note($0) }
+        top.sort { order($0) != order($1) ? order($0) < order($1) : createdAt($0) < createdAt($1) }
+
+        var rows: [SidebarRow] = []
+        for item in top {
+            switch item {
+            case .note(let n):
+                rows.append(SidebarRow(kind: .note(n), depth: 0, folderID: nil))
+            case .folder(let f):
+                rows.append(SidebarRow(kind: .folderHeader(f), depth: 0, folderID: f.parent?.id))
+                if !f.isCollapsed { appendFolderRows(f, depth: 1, into: &rows) }
+            }
+        }
+        return rows
+    }
+
+    private func appendFolderRows(_ f: Folder, depth: Int, into rows: inout [SidebarRow]) {
+        // Child folders + member notes INTERLEAVE by one shared order, so a note
+        // can sit above/below a sub-folder within the same parent.
+        enum Item { case folder(Folder); case note(Note) }
+        func order(_ i: Item) -> Int {
+            switch i { case .folder(let c): return c.sortIndex; case .note(let n): return n.manualSortIndex ?? Int.max }
+        }
+        func created(_ i: Item) -> Date {
+            switch i { case .folder(let c): return c.createdAt; case .note(let n): return n.createdAt }
+        }
+        var items: [Item] = (f.children ?? []).map { .folder($0) } + (f.notes ?? []).map { .note($0) }
+        items.sort { order($0) != order($1) ? order($0) < order($1) : created($0) < created($1) }
+        for item in items {
+            switch item {
+            case .note(let n):
+                rows.append(SidebarRow(kind: .note(n), depth: depth, folderID: f.id))
+            case .folder(let c):
+                rows.append(SidebarRow(kind: .folderHeader(c), depth: depth, folderID: f.id))
+                if !c.isCollapsed { appendFolderRows(c, depth: depth + 1, into: &rows) }
+            }
+        }
+    }
+
+    /// A within-tier single-note drag renders via list REORDER (the dragged
+    /// row is repositioned to the resolved slot, invisible — it IS the gap), not
+    /// via per-row offsets. This keeps resting positions == on-screen positions,
+    /// so the folder hit-test never drifts.
+    private var usesReorderRender: Bool {
+        session.isActive
+            && (session.draggedNoteID != nil || session.draggedFolderID != nil)
+            && session.sourceTier == tier && session.currentTier == tier
+    }
+
+    /// The within-tier dragged row ids (one note/folder, or the whole multi
+    /// selection) in flat order.
+    private var draggedRowIDs: [UUID] {
+        if session.isMulti { return session.draggedNoteIDs }
+        if let id = session.draggedNoteID ?? session.draggedFolderID { return [id] }
+        return []
+    }
+
+    /// The rendered rows: normally `flatRows`, but during a within-tier drag the
+    /// dragged row(s) are lifted and re-inserted contiguously at the resolved
+    /// slot (depth/parent), so the render == the eventual commit.
+    private var displayedFlatRows: [SidebarRow] {
+        guard usesReorderRender else { return flatRows }
+        let ids = Set(draggedRowIDs)
+        guard !ids.isEmpty else { return flatRows }
+        var rows = flatRows
+        let movers = rows.filter { ids.contains($0.rowID) }
+        guard !movers.isEmpty else { return flatRows }
+        rows.removeAll { ids.contains($0.rowID) }
+        let c = min(max(0, session.currentIndex), rows.count)
+        let rekeyed = movers.map {
+            SidebarRow(kind: $0.kind, depth: session.draggedRowDepth,
+                       folderID: session.nestTargetFolderID)
+        }
+        rows.insert(contentsOf: rekeyed, at: c)
+        return rows
+    }
+
+    @ViewBuilder
+    private func flatRowView(_ row: SidebarRow, at index: Int) -> some View {
+        switch row.kind {
+        case .folderHeader(let folder):
+            let isDraggedFolder = session.draggedFolderID == folder.id
+            if isDraggedFolder && usesReorderRender {
+                // The dragged folder collapses to the floating pill; its slot is
+                // the indent drop indicator at the resolved depth.
+                dropIndicatorRow(depth: row.depth)
+                    .simultaneousGesture(folderDragGesture(for: folder, at: index))
+            } else {
+                MacFolderRow(
+                    folder: folder, space: space, selectedNoteID: selectedNoteID,
+                    selectNote: selectNote, selection: selection, performBatch: performBatch,
+                    openInSplit: openInSplit, addToSplit: addToSplit, session: session,
+                    renamingFolderID: $renamingFolderID, depth: row.depth
+                )
+                .opacity(isDraggedFolder ? 0 : 1)
+                .offset(y: usesReorderRender ? 0 : offset(forIndex: index))
+                .simultaneousGesture(folderDragGesture(for: folder, at: index))
+            }
+        case .note(let note):
+            let isSource = session.isMulti
+                ? session.isDragged(note.id)
+                : (session.draggedNoteID == note.id && isSourceTier)
+            // NOTE: do NOT collapse the source row while nesting — removing a
+            // row mid-aim shifts the list and the folder slips out from under
+            // the cursor, oscillating the hit-test. Keep its slot (opacity 0).
+            let collapse = session.isMulti
+                ? isSource
+                : (isSource && session.isCrossTier)
+            if isSource && usesReorderRender && session.isMulti {
+                // Multi-drag: each dragged row is an invisible full-height
+                // placeholder (forms the block gap; the stack ghost shows them).
+                noteRowBody(note)
+                    .id(tabPresentationID(for: note))
+                    .padding(.leading, CGFloat(row.depth) * Self.folderIndentStep)
+                    .opacity(0)
+                    .simultaneousGesture(liveDragGesture(for: note, at: index))
+            } else if isSource && usesReorderRender {
+                // Single drag: a thin insertion indicator at the resolved depth
+                // (the floating ghost shows the content).
+                dropIndicatorRow(depth: row.depth)
+                    .frame(height: nil)
+                    .simultaneousGesture(liveDragGesture(for: note, at: index))
+            } else {
+                noteRowBody(note)
+                    .id(tabPresentationID(for: note))
+                    .padding(.leading, CGFloat(row.depth) * Self.folderIndentStep)
+                    .opacity(isSource ? 0 : 1)
+                    .frame(height: collapse ? 0 : nil)
+                    .offset(y: usesReorderRender ? 0 : offset(forIndex: index))
+                    .simultaneousGesture(liveDragGesture(for: note, at: index))
+            }
+        }
+    }
+
+    /// A thin insertion bar at `depth`'s indent — the visible placeholder for
+    /// the dragged row while reordering (shows where + how deep it'll land).
+    private func dropIndicatorRow(depth: Int) -> some View {
+        HStack(spacing: 0) {
+            Capsule()
+                .fill(spaceColor)
+                .frame(height: 3)
+        }
+        .frame(height: CrossTierDragSession.noteRowContentHeight)
+        .padding(.leading, CGFloat(depth) * Self.folderIndentStep + 10)
+        .padding(.trailing, 10)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named("notes-column"))
+        } action: { f in
+            session.dropIndicatorCenter = CGPoint(x: f.midX, y: f.midY)
+        }
+    }
+
+    @ViewBuilder
+    private func noteRowBody(_ note: Note) -> some View {
+        if let splitPair = splitPairs.first(where: { $0.anchorID == note.id }) {
+            MacSplitTabRow(
+                primary: splitPair.primary,
+                secondary: splitPair.secondary,
+                onSelect: { selectNote(splitPair.primary) },
+                onSeparate: { dissolveSplit(splitPair.primary.id, tier, space) },
+                isFocused: selectedNoteID == splitPair.primary.id
+                    || selectedNoteID == splitPair.secondary.id,
+                tint: spaceColor
+            )
+        } else if note.id == pendingSplitPrimaryID {
+            MacSplitTabRow(
+                primary: note,
+                secondary: nil,
+                onSelect: { selectNote(note) },
+                isFocused: true,
+                onCancelPending: cancelPendingSplit,
+                tint: spaceColor
+            )
+        } else {
+            MacNoteRow(
+                note: note,
+                space: space,
+                isSelected: selectedNoteID == note.id,
+                showDropIndicator: false,
+                indicatorColor: spaceColor,
+                selectNote: selectNote,
+                selection: selection,
+                performBatch: performBatch,
+                openInSplit: openInSplit,
+                addToSplit: addToSplit,
+                orderedIDs: orderedNoteIDs
+            )
+        }
     }
 
     /// Unified vertical offset for the row at `index` in this tier.
@@ -3591,10 +3984,12 @@ private struct MacSidebarGroup: View {
     /// count of non-dragged rows before `i` (collapsed rows take no space, so
     /// the cursor-derived `currentIndex` is already in visible terms).
     private func multiOffset(forIndex i: Int) -> CGFloat {
-        if session.isDragged(notes[i].id) { return 0 }
+        let rows = flatRows
+        guard i < rows.count else { return 0 }
+        if session.isDragged(rows[i].rowID) { return 0 }
         guard isCurrentTier else { return 0 }
         var visibleIndex = 0
-        for j in 0..<i where !session.isDragged(notes[j].id) { visibleIndex += 1 }
+        for j in 0..<i where !session.isDragged(rows[j].rowID) { visibleIndex += 1 }
         // Gap opens so the grabbed row lands at currentIndex (block top is
         // currentIndex - primaryGroupIndex), matching the floating stack.
         let gapStart = max(0, session.currentIndex - session.primaryGroupIndex)
@@ -3608,12 +4003,12 @@ private struct MacSidebarGroup: View {
         if session.isMulti { return multiOffset(forIndex: i) }
 
         // Post-commit short-circuit: the dragged note is now at its target
-        // slot in this tier's `notes` (true for within-tier reorder once
-        // the manualSortIndex update lands, and for cross-tier
-        // destinations once the tier change lands). Return 0 for every
-        // row so nothing visibly shifts before `session.reset()`.
+        // slot in this tier's flat list (true for within-tier reorder once
+        // the order update lands, and for cross-tier destinations once the
+        // tier change lands). Return 0 for every row so nothing visibly
+        // shifts before `session.reset()`.
         if let id = session.draggedNoteID,
-           let idx = notes.firstIndex(where: { $0.id == id }),
+           let idx = flatRows.firstIndex(where: { $0.rowID == id }),
            idx == session.currentIndex {
             return 0
         }
@@ -3628,7 +4023,7 @@ private struct MacSidebarGroup: View {
                 // at release. Pre-shift those rows by -3 during the drag
                 // so they're already at their post-commit positions.
                 if let id = session.draggedNoteID,
-                   notes.contains(where: { $0.id == id }),
+                   flatRows.contains(where: { $0.rowID == id }),
                    i > session.sourceIndex {
                     return -3
                 }
@@ -3702,14 +4097,31 @@ private struct MacSidebarGroup: View {
                             y: value.startLocation.y
                         )
                     }
-                    session.noteCountsByTier[tier] = notes.count
+                    session.noteCountsByTier[tier] = flatRows.count
+                    // Grab anchors for the horizontal/indent steering.
+                    session.dragStartCursorX = value.location.x
+                    session.dragSourceDepth = flatRows.first { $0.rowID == note.id }?.depth ?? 0
+                    // A note can be one level deeper than the deepest folder.
+                    session.draggedDepthCap = Folder.maxDepth + 1
+                    // Publish the RESTING rows (this tier minus ALL dragged
+                    // notes) so the hit-test resolves a stable drop slot.
+                    let dragged = Set(session.draggedNoteIDs)
+                    session.tierFolderRows[tier] = flatRows
+                        .filter { !dragged.contains($0.rowID) }
+                        .map { (isFolder: $0.isFolder,
+                                folderID: $0.isFolder ? $0.rowID : $0.folderID,
+                                depth: $0.depth) }
                 }
-                // Track 2D translation. Row-mode rendering ignores
-                // `translation.width` (ghost anchored to row tier midX),
-                // but tile-mode rendering uses it so when a row drag
-                // enters Essentials and morphs to a tile, the tile
-                // follows the cursor horizontally.
                 session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
+                // Resolve the PARENT folder for the current (gap, depth) so the
+                // target folder highlights and the commit knows the membership.
+                if session.sourceTier == tier && session.currentTier == tier
+                    && session.draggedFolderID == nil {
+                    session.nestTargetFolderID = resolveParentFolderID(
+                        gap: session.currentIndex, depth: session.draggedRowDepth)
+                } else {
+                    session.nestTargetFolderID = nil
+                }
             }
             .onEnded { _ in
                 let stuckID = session.draggedNoteID
@@ -3719,11 +4131,100 @@ private struct MacSidebarGroup: View {
             }
     }
 
+
+    /// Drag a top-level folder header to reorder it among the tier's top-level
+    /// items. The folder collapses to a single row for the drag; its contents
+    /// follow it to the new position (they render after the header).
+    private func folderDragGesture(for folder: Folder, at index: Int) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("notes-column"))
+            .onChanged { value in
+                if session.draggedFolderID == nil && session.draggedNoteID == nil {
+                    let folderDepth = flatRows.first { $0.rowID == folder.id }?.depth ?? 0
+                    session.dragGeneration &+= 1
+                    session.draggedFolderID = folder.id
+                    session.draggedFolderWasExpanded = !folder.isCollapsed
+                    session.draggedNoteIDs = []
+                    session.sourceSpaceID = space.id
+                    session.sourceTier = tier
+                    session.sourceIndex = index
+                    session.currentTier = tier
+                    session.currentIndex = index
+                    session.dragStartCursorX = value.location.x
+                    session.dragSourceDepth = folderDepth
+                    // A folder may descend only so far that its DEEPEST child
+                    // still fits under Folder.maxDepth.
+                    session.draggedDepthCap = max(0, Folder.maxDepth - folderSubtreeHeight(folder))
+                    let tierFrame = session.tierFrames[tier] ?? .zero
+                    session.sourceRowCenter = tierFrame.height > 0
+                        ? CGPoint(x: tierFrame.midX,
+                                  y: tierFrame.minY + CGFloat(index) * rowHeight
+                                     + CrossTierDragSession.noteRowContentHeight / 2)
+                        : CGPoint(x: columnWidth / 2, y: value.startLocation.y)
+                    // Collapse the folder (real `isCollapsed`) so it + its subtree
+                    // lift as a single clean row; publish the resting rows minus
+                    // this folder header (descendants are now folded away).
+                    if !folder.isCollapsed {
+                        withAnimation(.smooth(duration: 0.18)) {
+                            try? FolderService(context: modelContext).setCollapsed(folder, true)
+                        }
+                    }
+                    session.noteCountsByTier[tier] = flatRows.count
+                    session.tierFolderRows[tier] = flatRows
+                        .filter { $0.rowID != folder.id }
+                        .map { (isFolder: $0.isFolder,
+                                folderID: $0.isFolder ? $0.rowID : $0.folderID,
+                                depth: $0.depth) }
+                }
+                session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
+                if session.sourceTier == tier && session.currentTier == tier {
+                    session.nestTargetFolderID = resolveParentFolderID(
+                        gap: session.currentIndex, depth: session.draggedRowDepth)
+                } else {
+                    session.nestTargetFolderID = nil
+                }
+            }
+            .onEnded { _ in
+                let stuckID = session.draggedFolderID
+                let gen = session.dragGeneration
+                commitDrag()
+                session.scheduleWatchdog(for: stuckID, generation: gen)
+            }
+    }
+
+    /// Deepest nesting below `folder` (0 = no sub-folders).
+    private func folderSubtreeHeight(_ folder: Folder) -> Int {
+        let children = folder.children ?? []
+        guard !children.isEmpty else { return 0 }
+        return 1 + (children.map { folderSubtreeHeight($0) }.max() ?? 0)
+    }
+
+    /// Parent folder id for the indent-model drop at (`gap`, `depth`) — the
+    /// ancestor folder at `depth-1` on the previous row's chain, or nil for
+    /// top-level. `gap` is an index into the resting (dragged-excluded) rows.
+    private func resolveParentFolderID(gap: Int, depth d: Int) -> UUID? {
+        guard d > 0 else { return nil }
+        var dragged = Set(session.draggedNoteIDs)
+        if let fid = session.draggedFolderID { dragged.insert(fid) }
+        guard !dragged.isEmpty else { return nil }
+        let rest = flatRows.filter { !dragged.contains($0.rowID) }
+        let pi = min(gap, rest.count) - 1
+        guard pi >= 0 else { return nil }   // gap at the very top → top-level
+        var anchor: Folder?
+        switch rest[pi].kind {
+        case .folderHeader(let f): anchor = f
+        case .note(let n): anchor = n.folder
+        }
+        while let a = anchor, a.depth > d - 1 { anchor = a.parent }
+        if let a = anchor, a.depth == d - 1 { return a.id }
+        return nil
+    }
+
     /// Unified release path: animate the floating ghost (via
     /// `session.translation`) to sit exactly over the destination slot, then
     /// commit the data and clear the session non-animated. Identical for
     /// within-tier reorder and cross-tier promotion/demotion.
     private func commitDrag() {
+        if let fid = session.draggedFolderID { commitFolderDrag(folderID: fid); return }
         if session.isMulti { commitMultiDrag(); return }
 
         guard let id = session.draggedNoteID,
@@ -3781,11 +4282,15 @@ private struct MacSidebarGroup: View {
             session.frozenTileWidth = cellW - 16
         } else {
             targetCenterX = destFrame.midX
-            // Match the source-center convention: land on the row's visible
-            // content center so the ghost arrives exactly where the real row
-            // will appear (no 1.5pt second snap).
-            targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight
-                + CrossTierDragSession.noteRowContentHeight / 2
+            // Within-tier indent drag: settle to the live drop-indicator's
+            // actual position (WYSIWYG) so release lands exactly on the bar.
+            // Other cases use the row-slot convention.
+            if !crossTier, let c = session.dropIndicatorCenter {
+                targetCenterY = c.y
+            } else {
+                targetCenterY = destFrame.minY + CGFloat(destIndex) * rowHeight
+                    + CrossTierDragSession.noteRowContentHeight / 2
+            }
             session.frozenAsTile = false
         }
         let targetTranslationX = targetCenterX - session.sourceRowCenter.x
@@ -3798,43 +4303,15 @@ private struct MacSidebarGroup: View {
                 height: targetTranslationY
             )
         } completion: {
-            // Commit data without an animation context. Pre-shaped layout
-            // (collapsed source row + tier-end expansion/contraction) means
-            // pre/post-commit visual positions match — animating would
-            // produce an unwanted "settle" on every release.
-            //
-            // The Essentials section's grow/shrink is still animated
-            // separately via the EssentialsLayoutKey spring on the outer
-            // VStack, which observes the favorite count change.
-            // `destIndex` came from `currentIndex`, which is computed against the
-            // VISIBLE row list (this tier's `notes`, already filtered by hidden
-            // split secondary + search). `performMove` inserts into the FULL
-            // tier list. If a hidden note sits before the drop spot, the two
-            // index spaces diverge → ghost glides to the visual slot, but the
-            // commit lands the row elsewhere → "snaps right then teleports."
-            // For within-tier reorder, translate to a full-list index using the
-            // visible note that should sit JUST BEFORE source after the move.
-            let adjustedDestIndex: Int
+            // Within-tier (same tier + space): membership-aware flat commit —
+            // the note lands at its flat slot and joins / leaves a folder based
+            // on the row above the drop. Cross-tier keeps the standalone move
+            // (performMove clears `folder`).
             if !crossTier && source.space?.id == destSpace.id {
-                let visibleWithoutSource = notes.filter { $0.id != source.id }
-                if destIndex <= 0 || visibleWithoutSource.isEmpty {
-                    adjustedDestIndex = 0
-                } else if destIndex >= visibleWithoutSource.count {
-                    let fullCount = allNotes.filter {
-                        $0.tier == dest && $0.space?.id == destSpace.id && $0.folder == nil && $0.id != source.id
-                    }.count
-                    adjustedDestIndex = fullCount
-                } else {
-                    let anchorID = visibleWithoutSource[destIndex - 1].id
-                    let fullTier = allNotes
-                        .filter { $0.tier == dest && $0.space?.id == destSpace.id && $0.folder == nil && $0.id != source.id }
-                        .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
-                    adjustedDestIndex = (fullTier.firstIndex { $0.id == anchorID } ?? -1) + 1
-                }
+                commitWithinTierFlat(source: source, flatDropIndex: destIndex)
             } else {
-                adjustedDestIndex = destIndex
+                performMove(source: source, dest: dest, destIndex: destIndex, crossTier: crossTier, destSpace: destSpace)
             }
-            performMove(source: source, dest: dest, destIndex: adjustedDestIndex, crossTier: crossTier, destSpace: destSpace)
             // Dragging the split tab moves the pair: place the secondary right
             // after the primary in its new tier/space, keeping the split.
             // EXCEPT into Essentials — favorites are single tiles, so dragging
@@ -3851,6 +4328,201 @@ private struct MacSidebarGroup: View {
                     session.reset()
                 }
             }
+        }
+    }
+
+    /// Within-tier release (indent model): place `source` at flat gap
+    /// `flatDropIndex` with membership = the resolved parent folder
+    /// (`nestTargetFolderID`, nil = top-level), then renumber the tier. A closed
+    /// parent opens so the note is revealed.
+    private func commitWithinTierFlat(source: Note, flatDropIndex: Int) {
+        // Commit EXACTLY what's on screen: `displayedFlatRows` already has the
+        // dragged row at its drop slot with the resolved parent (folderID), so
+        // committing that order is guaranteed WYSIWYG — the note lands on the
+        // bar, never elsewhere.
+        let rows = displayedFlatRows
+        guard let srcRow = rows.first(where: { $0.rowID == source.id }) else { return }
+        let parentID = srcRow.folderID
+        let parent = parentID.flatMap { id in
+            try? modelContext.fetch(
+                FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
+        }
+        let wasCollapsed = parent?.isCollapsed ?? false
+        if let parent {
+            source.folder = parent
+            source.tier = parent.tier
+            if let sp = parent.space { source.space = sp }
+        } else {
+            source.folder = nil
+        }
+        source.updatedAt = Date()
+        renumber(rows)
+        try? modelContext.save()
+        if wasCollapsed, let parent {
+            withAnimation(.smooth(duration: 0.22)) {
+                try? FolderService(context: modelContext).setCollapsed(parent, false)
+            }
+        }
+    }
+
+    /// Reassign order counters from a desired flat row order: top-level folders
+    /// + standalone notes share one counter (interleave); each folder's child
+    /// folders and member notes get their own counters.
+    /// One shared 0..n counter PER CONTAINER (keyed by `row.folderID`, nil =
+    /// top-level) across both child folders and member notes — so they interleave
+    /// and the rendered order matches the committed order exactly.
+    private func renumber(_ rows: [SidebarRow]) {
+        var counter: [String: Int] = [:]
+        for row in rows {
+            let key = row.folderID?.uuidString ?? "_top"
+            let v = counter[key] ?? 0
+            counter[key] = v + 1
+            switch row.kind {
+            case .note(let n): n.manualSortIndex = v
+            case .folderHeader(let f): f.sortIndex = v
+            }
+        }
+    }
+
+    /// Release path for a folder header drag (indent model): RE-PARENT the
+    /// folder to the resolved parent (nil = top-level) at the drop slot — its
+    /// whole subtree travels with it. Within-tier only — a drop over another
+    /// tier snaps back.
+    private func commitFolderDrag(folderID: UUID) {
+        let wasExpanded = session.draggedFolderWasExpanded
+        guard let folder = try? modelContext.fetch(
+            FetchDescriptor<Folder>(predicate: #Predicate { $0.id == folderID })).first
+        else { settleFolderBack(); return }
+        // Cross-tier (Pinned ↔ Notes): move the whole subtree to the other tier
+        // at top level (favorites is excluded for folders upstream).
+        if let destTier = session.currentTier, destTier != session.sourceTier {
+            commitFolderCrossTier(folder: folder, destTier: destTier, wasExpanded: wasExpanded)
+            return
+        }
+
+        let parentID = session.nestTargetFolderID
+        let parent = parentID.flatMap { id in
+            try? modelContext.fetch(
+                FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
+        }
+        // Safety: never nest a folder into itself / a descendant.
+        let svc = FolderService(context: modelContext)
+        let safeParent = (parent != nil && svc.canNest(folder, under: parent)) ? parent : nil
+        let safeParentID = (parent == nil || safeParent != nil) ? parentID : nil
+
+        // Commit exactly the previewed order: displayedFlatRows has the folder
+        // header at its drop slot with folderID = the resolved parent.
+        let rows = displayedFlatRows
+        folder.parent = safeParent
+        let wasParentCollapsed = safeParent?.isCollapsed ?? false
+        // Re-key the folder header row to the safe parent before renumbering.
+        let committed = rows.map { r -> SidebarRow in
+            r.rowID == folderID
+                ? SidebarRow(kind: r.kind, depth: r.depth, folderID: safeParentID)
+                : r
+        }
+        renumber(committed)
+        try? modelContext.save()
+
+        let target = session.dropIndicatorCenter
+        let destFrame = session.tierFrames[tier] ?? .zero
+        let targetCenterY = target?.y
+            ?? (destFrame.minY + CGFloat(session.currentIndex) * rowHeight
+                + CrossTierDragSession.noteRowContentHeight / 2)
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
+        } completion: {
+            DispatchQueue.main.async {
+                var tx = Transaction(); tx.disablesAnimations = true
+                withTransaction(tx) { session.reset() }
+                // Re-open the moved folder (and its new parent if it was closed)
+                // as a separate chevron animation, decoupled from the drag.
+                if wasParentCollapsed, let safeParent {
+                    withAnimation(.smooth(duration: 0.2)) {
+                        try? FolderService(context: modelContext).setCollapsed(safeParent, false)
+                    }
+                }
+                reExpandDraggedFolder(folder, wasExpanded: wasExpanded)
+            }
+        }
+    }
+
+    /// Move a dragged folder's subtree to the OTHER list tier (same space), at
+    /// top level (appended), then glide the ghost to the destination.
+    private func commitFolderCrossTier(folder: Folder, destTier: NoteTier, wasExpanded: Bool) {
+        let svc = FolderService(context: modelContext)
+        try? svc.changeTier(folder, to: destTier)
+        folder.parent = nil
+
+        // Map the flat drop slot to a TOP-LEVEL insertion index in the dest tier.
+        let destRows = session.tierFolderRows[destTier] ?? []
+        let c = min(max(0, session.currentIndex), destRows.count)
+        let topInsert = destRows.prefix(c).filter { $0.depth == 0 }.count
+
+        enum Item { case folder(Folder); case note(Note) }
+        func order(_ i: Item) -> Int {
+            switch i { case .folder(let f): return f.sortIndex; case .note(let n): return n.manualSortIndex ?? Int.max }
+        }
+        let spaceID = space.id
+        let destFolders = ((try? modelContext.fetch(FetchDescriptor<Folder>(predicate: #Predicate {
+            $0.space?.id == spaceID
+        }))) ?? []).filter { $0.tier == destTier && $0.parent == nil && $0.id != folder.id }
+        let destNotes = ((try? modelContext.fetch(FetchDescriptor<Note>(predicate: #Predicate {
+            $0.space?.id == spaceID
+        }))) ?? []).filter { $0.tier == destTier && $0.folder == nil }
+        var items: [Item] = (destFolders.map { Item.folder($0) } + destNotes.map { Item.note($0) })
+            .sorted { order($0) < order($1) }
+        items.insert(.folder(folder), at: min(max(0, topInsert), items.count))
+        var counter = 0
+        for it in items {
+            switch it {
+            case .folder(let f): f.sortIndex = counter
+            case .note(let n): n.manualSortIndex = counter
+            }
+            counter += 1
+        }
+        if let src = session.sourceTier { try? svc.normalizeTierOrder(tier: src, in: space) }
+        try? modelContext.save()
+
+        let destFrame = session.tierFrames[destTier] ?? .zero
+        let targetCenterY = destFrame.minY + CGFloat(c) * rowHeight
+            + CrossTierDragSession.noteRowContentHeight / 2
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
+        } completion: {
+            DispatchQueue.main.async {
+                var tx = Transaction(); tx.disablesAnimations = true
+                withTransaction(tx) { session.reset() }
+                reExpandDraggedFolder(folder, wasExpanded: wasExpanded)
+            }
+        }
+    }
+
+    private func settleFolderBack() {
+        let wasExpanded = session.draggedFolderWasExpanded
+        let fid = session.draggedFolderID
+        let folder = fid.flatMap { id in
+            try? modelContext.fetch(
+                FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
+        }
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = .zero
+        } completion: {
+            DispatchQueue.main.async {
+                var tx = Transaction(); tx.disablesAnimations = true
+                withTransaction(tx) { session.reset() }
+                reExpandDraggedFolder(folder, wasExpanded: wasExpanded)
+            }
+        }
+    }
+
+    private func reExpandDraggedFolder(_ folder: Folder?, wasExpanded: Bool) {
+        guard wasExpanded, let folder else { return }
+        withAnimation(.smooth(duration: 0.2)) {
+            try? FolderService(context: modelContext).setCollapsed(folder, false)
         }
     }
 
@@ -3922,6 +4594,12 @@ private struct MacSidebarGroup: View {
     private func commitMultiDrag() {
         guard let dest = session.currentTier else { wipe(); return }
         let ids = session.draggedNoteIDs
+        // Within-tier multi-drag → indent-model commit (the whole block moves to
+        // the resolved parent/depth at the drop slot).
+        if dest == session.sourceTier {
+            commitMultiWithinTier()
+            return
+        }
         // Promote the whole group INTO Essentials (a grid, not rows) — commit at
         // the grid hit-test index and let the grid reflow in (no row-glide math).
         if dest == .favorite {
@@ -3964,6 +4642,48 @@ private struct MacSidebarGroup: View {
             tx.disablesAnimations = true
             withTransaction(tx) {
                 session.reset()
+            }
+        }
+    }
+
+    /// Within-tier multi-drag commit (indent model): move the whole selection
+    /// to the resolved parent/depth at the drop slot, committing exactly the
+    /// previewed order (`displayedFlatRows`).
+    private func commitMultiWithinTier() {
+        let ids = Set(session.draggedNoteIDs)
+        let parentID = session.nestTargetFolderID
+        let parent = parentID.flatMap { id in
+            try? modelContext.fetch(
+                FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
+        }
+        let wasCollapsed = parent?.isCollapsed ?? false
+        let now = Date()
+        for n in allNotes where ids.contains(n.id) {
+            n.folder = parent
+            if let parent { n.tier = parent.tier; if let sp = parent.space { n.space = sp } }
+            n.updatedAt = now
+        }
+        renumber(displayedFlatRows)
+        try? modelContext.save()
+
+        // The grabbed row sits at block-top (currentIndex) + its index in the
+        // block, so glide the stack so its primary lands there.
+        let destFrame = session.tierFrames[tier] ?? .zero
+        let primarySlot = session.currentIndex + session.primaryGroupIndex
+        let targetCenterY = destFrame.minY + CGFloat(primarySlot) * rowHeight
+            + CrossTierDragSession.noteRowContentHeight / 2
+        withAnimation(.smooth(duration: 0.18)) {
+            session.isSettling = true
+            session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
+        } completion: {
+            DispatchQueue.main.async {
+                var tx = Transaction(); tx.disablesAnimations = true
+                withTransaction(tx) { session.reset() }
+                if wasCollapsed, let parent {
+                    withAnimation(.smooth(duration: 0.2)) {
+                        try? FolderService(context: modelContext).setCollapsed(parent, false)
+                    }
+                }
             }
         }
     }
@@ -4066,6 +4786,7 @@ private struct MacFolderRow: View {
     let performBatch: (NoteBatchAction) -> Void
     let openInSplit: (Note) -> Void
     let addToSplit: (Note) -> Void
+    let session: CrossTierDragSession
     @Binding var renamingFolderID: UUID?
     var depth: Int = 0
 
@@ -4077,6 +4798,11 @@ private struct MacFolderRow: View {
 
     private var isExpanded: Bool { !folder.isCollapsed }
     private var isRenaming: Bool { renamingFolderID == folder.id }
+    /// A dragged note is aimed at this folder → it will drop inside (highlight).
+    private var isNestTarget: Bool { session.nestTargetFolderID == folder.id }
+    private var folderTint: Color {
+        Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
+    }
     private var canAddSubfolder: Bool { folder.depth < Folder.maxDepth }
 
     private var childFolders: [Folder] {
@@ -4091,44 +4817,20 @@ private struct MacFolderRow: View {
 
     private var totalCount: Int { notes.count + childFolders.count }
 
+    // Header-only: the folder's child folders + member notes are rendered as
+    // sibling rows in the tier's flat list (`MacSidebarGroup.flatRows`), not
+    // nested here — so every row shares one identity space and the drag engine
+    // can reorder across folder boundaries without rebuilding views.
     var body: some View {
-        VStack(spacing: 2) {
-            header
+        header
+    }
 
-            if isExpanded {
-                // Nested folders first, then loose notes — matches Zen's
-                // folder-over-tab ordering within a disclosure group.
-                ForEach(childFolders) { child in
-                    MacFolderRow(
-                        folder: child,
-                        space: space,
-                        selectedNoteID: selectedNoteID,
-                        selectNote: selectNote,
-                        selection: selection,
-                        performBatch: performBatch,
-                        openInSplit: openInSplit,
-                        addToSplit: addToSplit,
-                        renamingFolderID: $renamingFolderID,
-                        depth: depth + 1
-                    )
-                }
-
-                ForEach(notes) { note in
-                    MacNoteRow(
-                        note: note,
-                        space: space,
-                        isSelected: selectedNoteID == note.id,
-                        selectNote: selectNote,
-                        selection: selection,
-                        performBatch: performBatch,
-                        openInSplit: openInSplit,
-                        addToSplit: addToSplit,
-                        orderedIDs: notes.map(\.id)
-                    )
-                    .padding(.leading, CGFloat(depth) * indentStep + 18)
-                }
-            }
-        }
+    // Nest target = a stronger version of the neutral hover fill (reads clearly
+    // against the colored space background, unlike a space-tinted fill).
+    private var headerFillColor: Color {
+        if isNestTarget { return Color.primary.opacity(colorScheme == .dark ? 0.18 : 0.12) }
+        if isHovering && !isRenaming { return Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.07) }
+        return .clear
     }
 
     private var header: some View {
@@ -4165,11 +4867,9 @@ private struct MacFolderRow: View {
         .frame(height: 32)
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .background {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isHovering && !isRenaming
-                      ? Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.07)
-                      : Color.clear)
+            RoundedRectangle(cornerRadius: 7, style: .continuous).fill(headerFillColor)
         }
+        .animation(.smooth(duration: 0.14), value: isNestTarget)
         .padding(.leading, CGFloat(depth) * indentStep)
         .onTapGesture { if !isRenaming { toggleExpanded() } }
         .onHover { isHovering = $0 }
@@ -4409,6 +5109,8 @@ private struct MacNoteRow: View {
             Button("Open in Split View", systemImage: "rectangle.split.2x1") { performBatch(.openSplit) }
             Divider()
         }
+        Button("New Folder from \(n) Notes", systemImage: "folder.badge.plus") { performBatch(.group) }
+        Divider()
         Button("Make \(n) Essential", systemImage: "star.fill") { performBatch(.makeEssential) }
         Button("Pin \(n) Notes", systemImage: "pin.fill") { performBatch(.pin) }
         Button("Move \(n) to Notes", systemImage: "tray") { performBatch(.moveToNotes) }
