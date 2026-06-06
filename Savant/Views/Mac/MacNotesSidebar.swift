@@ -4778,13 +4778,23 @@ private struct MacSidebarGroup: View {
                 FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
         }
         let wasCollapsed = parent?.isCollapsed ?? false
+
+        // Capture the previewed order BEFORE mutating membership. `displayedFlatRows`
+        // recomputes `flatRows` from the live model, so changing `n.folder` here
+        // would empty the source folder, shift every row below it, and reset the
+        // popped notes to stale low sort-indices — making the drag-resolved
+        // `currentIndex` land them somewhere else (the "released at the top" bug).
+        // The rekeyed movers already carry `folderID = nestTargetFolderID`, so
+        // `renumber` keys them to the right container.
+        let finalRows = displayedFlatRows
+
         let now = Date()
         for n in allNotes where ids.contains(n.id) {
             n.folder = parent
             if let parent { n.tier = parent.tier; if let sp = parent.space { n.space = sp } }
             n.updatedAt = now
         }
-        renumber(displayedFlatRows)
+        renumber(finalRows)
         try? modelContext.save()
 
         // The grabbed row sits at block-top (currentIndex) + its index in the
