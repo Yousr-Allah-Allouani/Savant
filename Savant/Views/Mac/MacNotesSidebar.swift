@@ -789,14 +789,6 @@ private struct MacSidebarFolderGhost: View {
 
 private struct MacSidebarFloatingGhost: View {
     @Environment(\.colorScheme) private var colorScheme
-    // One-time "you can drag sideways to nest" hint: the first time the user
-    // ever drags a note in a tier that HAS folders, the ghost does a small
-    // rightward wiggle, then never again.
-    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
-    // TEMP DEBUG: when on, the wiggle replays on EVERY note drag so the feel can
-    // be dialed in. Toggle from the space (right-click name) menu. Remove later.
-    @AppStorage("savant.debugAlwaysIndentHint") private var debugAlwaysIndentHint = false
-    @State private var indentNudgeX: CGFloat = 0
 
     let note: Note
     let activeSpace: Space?
@@ -882,8 +874,6 @@ private struct MacSidebarFloatingGhost: View {
             }
         }
         .position(x: ghostX, y: ghostCenterY)
-        .offset(x: indentNudgeX)
-        .onAppear { playIndentHintIfNeeded() }
         .animation(.smooth(duration: 0.16), value: overEditor)
         // Stronger lift while "picked up" (radius 8), easing down to the
         // resting pill's shadow during the release glide so the handoff to the
@@ -892,51 +882,6 @@ private struct MacSidebarFloatingGhost: View {
         .shadow(color: settleShadowColor, radius: settleShadowRadius, x: 0, y: settleShadowY)
         .allowsHitTesting(false)
         .animation(.smooth(duration: 0.12), value: asTile)
-    }
-
-    /// First-ever note drag in a tier that has folders → a small rightward
-    /// wiggle of the ghost reveals the horizontal-indent (nest) gesture. The
-    /// spring overshoots back past zero, so one push reads as a wiggle. Gated to
-    /// single-note drags with somewhere to nest; if there are no folders yet we
-    /// DON'T spend the one-shot (it'll fire on a later drag once folders exist).
-    private func playIndentHintIfNeeded() {
-        guard debugAlwaysIndentHint || !seenIndentHint,
-              !session.isMulti, splitPair == nil, pendingPrimary == nil else { return }
-        let hasFolders = (session.sourceTier.flatMap { session.tierFolderRows[$0] } ?? [])
-            .contains { $0.isFolder }
-        guard debugAlwaysIndentHint || hasFolders else { return }
-        // Brief delay so it reads as a hint AFTER the lift, not part of the grab.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            // Only spend the one-shot if the drag is still live — a fast drop
-            // shouldn't burn the hint before it ever showed.
-            guard session.draggedNoteID == note.id, !session.isSettling else { return }
-            seenIndentHint = true
-            // Debug: a big, slow, multi-cycle shake so it's unmistakable. Prod:
-            // a single subtle push-and-spring-back.
-            if debugAlwaysIndentHint {
-                wiggle(cyclesLeft: 5, amplitude: 36)
-            } else {
-                withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { indentNudgeX = 18 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.5)) { indentNudgeX = 0 }
-                }
-            }
-        }
-    }
-
-    /// Decaying left-right shake of the ghost (debug aid to make the wiggle
-    /// obvious). Alternates sign each cycle, shrinking the amplitude, then
-    /// settles to 0.
-    private func wiggle(cyclesLeft: Int, amplitude: CGFloat) {
-        guard cyclesLeft > 0 else {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { indentNudgeX = 0 }
-            return
-        }
-        let dir: CGFloat = cyclesLeft % 2 == 0 ? -1 : 1
-        withAnimation(.easeInOut(duration: 0.16)) { indentNudgeX = dir * amplitude }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) {
-            wiggle(cyclesLeft: cyclesLeft - 1, amplitude: amplitude * 0.78)
-        }
     }
 
     /// Shadow that matches the resting row once settled: the selected pill's
@@ -1618,8 +1563,6 @@ private struct MacSpaceNotesColumn: View {
     @State private var themeOpen = false
     @State private var isRenamingSpace = false
     @State private var draftName = ""
-    // TEMP DEBUG: replay the indent-hint wiggle on every note drag. Remove later.
-    @AppStorage("savant.debugAlwaysIndentHint") private var debugAlwaysIndentHint = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1666,11 +1609,6 @@ private struct MacSpaceNotesColumn: View {
         Button { createFolderHere() } label: { Label("New Folder", systemImage: "folder.badge.plus") }
         Divider()
         Button { openManageSpaces() } label: { Label("Manage Spaces…", systemImage: "square.grid.2x2") }
-        Divider()
-        // TEMP DEBUG: drag any note to see the indent-hint wiggle while it's on.
-        Toggle(isOn: $debugAlwaysIndentHint) {
-            Label("🐛 Replay indent wiggle on every drag", systemImage: "hand.draw")
-        }
         if canDeleteSpace {
             Divider()
             Button(role: .destructive) { requestDeleteSpace(space) } label: { Label("Delete Space", systemImage: "trash") }
