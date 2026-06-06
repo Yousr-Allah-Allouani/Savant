@@ -824,13 +824,16 @@ private struct MacSidebarFolderGhost: View {
 /// arrow gently oscillates left-right to point at the gesture; the pill itself
 /// stays put (static) so it reads as guidance, not a glitch.
 private struct IndentCoachmark: View {
-    @State private var arrowNudge = false
-
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "arrow.left.and.right")
                 .font(.system(size: 11, weight: .semibold))
-                .offset(x: arrowNudge ? 3 : -3)
+                // phaseAnimator loops on its own (no onAppear/withAnimation, which
+                // the entry transition was swallowing), so the arrow reliably
+                // glides left↔right the whole time the tip is up.
+                .phaseAnimator([-4.0, 4.0]) { view, x in
+                    view.offset(x: x)
+                } animation: { _ in .easeInOut(duration: 0.6) }
             Text("Drag sideways to nest")
                 .font(.system(size: 11, weight: .medium, design: .rounded))
         }
@@ -841,11 +844,6 @@ private struct IndentCoachmark: View {
         .overlay(Capsule().strokeBorder(.primary.opacity(0.08), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
         .fixedSize()
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.62).repeatForever(autoreverses: true)) {
-                arrowNudge = true
-            }
-        }
     }
 }
 
