@@ -793,6 +793,9 @@ private struct MacSidebarFloatingGhost: View {
     // ever drags a note in a tier that HAS folders, the ghost does a small
     // rightward wiggle, then never again.
     @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
+    // TEMP DEBUG: when on, the wiggle replays on EVERY note drag so the feel can
+    // be dialed in. Toggle from the space (right-click name) menu. Remove later.
+    @AppStorage("savant.debugAlwaysIndentHint") private var debugAlwaysIndentHint = false
     @State private var indentNudgeX: CGFloat = 0
 
     let note: Note
@@ -897,11 +900,11 @@ private struct MacSidebarFloatingGhost: View {
     /// single-note drags with somewhere to nest; if there are no folders yet we
     /// DON'T spend the one-shot (it'll fire on a later drag once folders exist).
     private func playIndentHintIfNeeded() {
-        guard !seenIndentHint,
+        guard debugAlwaysIndentHint || !seenIndentHint,
               !session.isMulti, splitPair == nil, pendingPrimary == nil else { return }
         let hasFolders = (session.sourceTier.flatMap { session.tierFolderRows[$0] } ?? [])
             .contains { $0.isFolder }
-        guard hasFolders else { return }
+        guard debugAlwaysIndentHint || hasFolders else { return }
         // Brief delay so it reads as a hint AFTER the lift, not part of the grab.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             // Only spend the one-shot if the drag is still live — a fast drop
@@ -1594,6 +1597,8 @@ private struct MacSpaceNotesColumn: View {
     @State private var themeOpen = false
     @State private var isRenamingSpace = false
     @State private var draftName = ""
+    // TEMP DEBUG: replay the indent-hint wiggle on every note drag. Remove later.
+    @AppStorage("savant.debugAlwaysIndentHint") private var debugAlwaysIndentHint = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1640,6 +1645,11 @@ private struct MacSpaceNotesColumn: View {
         Button { createFolderHere() } label: { Label("New Folder", systemImage: "folder.badge.plus") }
         Divider()
         Button { openManageSpaces() } label: { Label("Manage Spaces…", systemImage: "square.grid.2x2") }
+        Divider()
+        // TEMP DEBUG: drag any note to see the indent-hint wiggle while it's on.
+        Toggle(isOn: $debugAlwaysIndentHint) {
+            Label("🐛 Replay indent wiggle on every drag", systemImage: "hand.draw")
+        }
         if canDeleteSpace {
             Divider()
             Button(role: .destructive) { requestDeleteSpace(space) } label: { Label("Delete Space", systemImage: "trash") }
@@ -4112,10 +4122,12 @@ private struct MacSidebarGroup: View {
 
     /// A thin insertion bar at `depth`'s indent — the visible placeholder for
     /// the dragged row while reordering (shows where + how deep it'll land).
+    /// Filled with `.primary` (NOT the space color, which IS the background and
+    /// rendered the bar nearly invisible) so it contrasts on any space gradient.
     private func dropIndicatorRow(depth: Int) -> some View {
         HStack(spacing: 0) {
             Capsule()
-                .fill(spaceColor)
+                .fill(Color.primary.opacity(colorScheme == .dark ? 0.7 : 0.6))
                 .frame(height: 3)
         }
         .frame(height: CrossTierDragSession.noteRowContentHeight)
