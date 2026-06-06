@@ -752,6 +752,23 @@ private struct MacSidebarFolderGhost: View {
     private var count: Int { (folder.notes?.count ?? 0) + (folder.children?.count ?? 0) }
 
     var body: some View {
+        let cardX = session.sourceRowCenter.x + session.translation.width
+        let cardY = session.sourceRowCenter.y + session.translation.height
+        ZStack {
+            folderCard
+                .position(x: cardX, y: cardY)
+                .allowsHitTesting(false)
+            if showIndentCoach {
+                IndentCoachmark()
+                    .position(x: cardX, y: cardY + 16 + 22)   // 16 = half card height
+                    .allowsHitTesting(false)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .top)))
+            }
+        }
+        .onAppear { maybeShowIndentCoach() }
+    }
+
+    private var folderCard: some View {
         HStack(spacing: 8) {
             Image(systemName: "folder.fill")
                 .font(.system(size: 13, weight: .semibold))
@@ -779,11 +796,56 @@ private struct MacSidebarFolderGhost: View {
                 radius: session.isSettling ? 0 : 8, x: 0, y: session.isSettling ? 0 : 4)
         .frame(width: rowWidth, alignment: .trailing)
         .animation(.smooth(duration: 0.16), value: session.draggedRowDepth)
-        .position(
-            x: session.sourceRowCenter.x + session.translation.width,
-            y: session.sourceRowCenter.y + session.translation.height
-        )
-        .allowsHitTesting(false)
+    }
+
+    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
+    @State private var showIndentCoach = false
+
+    /// Folder drags also teach the sideways-nest gesture (once, shared flag) when
+    /// there's somewhere to go — another folder in the tier, or this one is
+    /// already nested (so it can pop out).
+    private func maybeShowIndentCoach() {
+        guard !seenIndentHint else { return }
+        let rows = session.sourceTier.flatMap { session.tierFolderRows[$0] } ?? []
+        let canNest = rows.contains { $0.isFolder && $0.folderID != folder.id } || folder.parent != nil
+        guard canNest else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard session.draggedFolderID == folder.id, !session.isSettling else { return }
+            seenIndentHint = true
+            withAnimation(.smooth(duration: 0.22)) { showIndentCoach = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                withAnimation(.smooth(duration: 0.25)) { showIndentCoach = false }
+            }
+        }
+    }
+}
+
+/// A small, clearly-designed tooltip teaching the sideways-nest gesture. The
+/// arrow gently oscillates left-right to point at the gesture; the pill itself
+/// stays put (static) so it reads as guidance, not a glitch.
+private struct IndentCoachmark: View {
+    @State private var arrowNudge = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.left.and.right")
+                .font(.system(size: 11, weight: .semibold))
+                .offset(x: arrowNudge ? 3 : -3)
+            Text("Drag sideways to nest")
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.primary.opacity(0.08), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        .fixedSize()
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.62).repeatForever(autoreverses: true)) {
+                arrowNudge = true
+            }
+        }
     }
 }
 
@@ -890,32 +952,13 @@ private struct MacSidebarFloatingGhost: View {
             .animation(.smooth(duration: 0.12), value: asTile)
 
             if showIndentCoach {
-                indentCoachmark
+                IndentCoachmark()
                     .position(x: ghostX, y: ghostCenterY + CrossTierDragSession.noteRowContentHeight / 2 + 22)
                     .allowsHitTesting(false)
                     .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .top)))
             }
         }
         .onAppear { maybeShowIndentCoach() }
-    }
-
-    /// A small, clearly-designed tooltip below the dragged card teaching the
-    /// sideways-nest gesture. Static (no motion) so it reads as guidance, not a
-    /// glitch.
-    private var indentCoachmark: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.left.and.right")
-                .font(.system(size: 11, weight: .semibold))
-            Text("Drag sideways to nest")
-                .font(.system(size: 11, weight: .medium, design: .rounded))
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(.primary.opacity(0.08), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
-        .fixedSize()
     }
 
     /// Show the coachmark once, on a single-note drag that actually has folders
