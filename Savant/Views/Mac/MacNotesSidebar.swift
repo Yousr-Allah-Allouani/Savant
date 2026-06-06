@@ -826,14 +826,16 @@ private struct MacSidebarFolderGhost: View {
 private struct IndentCoachmark: View {
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "arrow.left.and.right")
-                .font(.system(size: 11, weight: .semibold))
-                // phaseAnimator loops on its own (no onAppear/withAnimation, which
-                // the entry transition was swallowing), so the arrow reliably
-                // glides left↔right the whole time the tip is up.
-                .phaseAnimator([-2.0, 2.0]) { view, x in
-                    view.offset(x: x)
-                } animation: { _ in .easeInOut(duration: 0.85) }
+            // Driven by a clock (TimelineView) rather than an interpolating
+            // animation: the ghost re-renders every drag frame, which would
+            // interrupt a phaseAnimator/withAnimation and make the arrow stutter.
+            // A time-based sine is recomputed each frame, so it stays smooth.
+            TimelineView(.animation) { context in
+                let t = context.date.timeIntervalSinceReferenceDate
+                Image(systemName: "arrow.left.and.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .offset(x: sin(t * 3.2) * 2)
+            }
             Text("Drag sideways to nest")
                 .font(.system(size: 11, weight: .medium, design: .rounded))
         }
