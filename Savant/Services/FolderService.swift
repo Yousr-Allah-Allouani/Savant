@@ -188,4 +188,17 @@ struct FolderService {
         for n in (folder.notes ?? []) { n.tier = tier }
         for c in (folder.children ?? []) { applyTier(c, tier) }
     }
+
+    /// Move a folder's whole subtree to a new tier AND space (cross-space drag).
+    func move(_ folder: Folder, toTier tier: NoteTier, toSpace space: Space) throws {
+        applyTierSpace(folder, tier, space)
+        try context.save()
+    }
+
+    private func applyTierSpace(_ folder: Folder, _ tier: NoteTier, _ space: Space) {
+        folder.tier = tier
+        folder.space = space
+        for n in (folder.notes ?? []) { n.tier = tier; n.space = space }
+        for c in (folder.children ?? []) { applyTierSpace(c, tier, space) }
+    }
 }

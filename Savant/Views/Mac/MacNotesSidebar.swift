@@ -266,13 +266,22 @@ struct MacNotesSidebar: View {
             return ra == rb ? noteSort(a, b) : ra < rb
         }
         let anchor = ordered[0]
-        let folderTier: NoteTier = (anchor.tier == .pinned || anchor.tier == .random) ? anchor.tier : .pinned
+        // If the selection lives INSIDE a folder, create the new folder at the
+        // same indentation (nested under that parent) — unless that would exceed
+        // the max nesting depth, in which case fall back one level up.
+        let parentFolder = anchor.folder
+        let nestParent: Folder? = {
+            guard let pf = parentFolder else { return nil }
+            return (pf.depth + 1 <= Folder.maxDepth) ? pf : pf.parent
+        }()
+        let folderTier: NoteTier = nestParent?.tier
+            ?? ((anchor.tier == .pinned || anchor.tier == .random) ? anchor.tier : .pinned)
         let svc = FolderService(context: modelContext)
 
         let newFolder: Folder? = withAnimation(.smooth(duration: 0.24)) {
-            guard let folder = try? svc.create(in: space, tier: folderTier, parent: nil) else { return nil }
-            // Take the anchor's top-level slot so the folder forms in place.
-            if anchor.tier == folderTier, anchor.folder == nil, let idx = anchor.manualSortIndex {
+            guard let folder = try? svc.create(in: space, tier: folderTier, parent: nestParent) else { return nil }
+            // Take the anchor's slot within its container so the folder forms in place.
+            if anchor.folder?.id == nestParent?.id, let idx = anchor.manualSortIndex {
                 folder.sortIndex = idx
             }
             for (i, note) in ordered.enumerated() {
@@ -643,8 +652,8 @@ struct MacNotesSidebar: View {
     /// re-targets the new active column; release commits a cross-space move).
     /// Mirrors Zen's `#shouldSwitchSpace` + `handle_spaceIconDragOver`.
     private func handleDragOverTargets() {
-        // Single-note drags only for now (multi-drag cross-space is unhandled).
-        guard session.isActive, !session.isMulti, let x = session.cursorX else {
+        // Notes (single + multi) and folders can all switch spaces by edge/chip.
+        guard session.isActive, let x = session.cursorX else {
             cancelEdgeSwitch(); return
         }
 
@@ -3398,11 +3407,12 @@ final class CrossTierDragSession {
             newIndex = min(max(0, proposed), max(0, effective - 1))
         } else {
             let restInfo = tierFolderRows[target] ?? []
-            // Single note, folder, OR a multi-note selection all resolve to one
-            // (gap, depth) via the indent model.
-            let withinTier = target == sourceTier
+            // Notes use the indent model in ANY list tier (so dragging a note
+            // from Notes into a Pinned folder previews + nests). Folders use it
+            // only within their own tier (cross-tier folders land top-level).
+            let useIndent = !restInfo.isEmpty
                 && (draggedNoteID != nil || draggedFolderID != nil)
-            if withinTier {
+            if useIndent {
                 // Indent / horizontal model (file-tree style). VERTICAL (ghost
                 // center) picks the insertion gap; HORIZONTAL (cursor delta from
                 // grab) picks the depth, clamped to the legal [minDepth,maxDepth]
@@ -3420,7 +3430,10 @@ final class CrossTierDragSession {
                 maxD = max(minD, min(maxD, draggedDepthCap))
                 let dx = (cursorX ?? dragStartCursorX) - dragStartCursorX
                 let steps = Int((dx / 22).rounded())
-                let d = max(minD, min(maxD, dragSourceDepth + steps))
+                // Within-tier: steer relative to the row's own depth. Cross-tier:
+                // arrives at top level (0), drag right to nest into a dest folder.
+                let baseDepth = (target == sourceTier) ? dragSourceDepth : 0
+                let d = max(minD, min(maxD, baseDepth + steps))
                 newIndex = g
                 resolvedDepth = d
             } else {
@@ -3430,15 +3443,15 @@ final class CrossTierDragSession {
             }
         }
 
-        let depthChanged = target == sourceTier && draggedRowDepth != resolvedDepth
+        let depthChanged = draggedRowDepth != resolvedDepth
         if currentTier != target || currentIndex != newIndex || depthChanged {
             let tierChanged = currentTier != target
             currentTier = target
             currentIndex = newIndex
-            // Within-tier: the resolver drives the ghost indent; cross-tier the
-            // note is standalone (depth 0). The PARENT folder (membership) is
-            // computed view-side from `currentIndex` + this depth.
-            draggedRowDepth = (target == sourceTier) ? resolvedDepth : 0
+            // The resolver drives the ghost indent (0 for the continuous path).
+            // The PARENT folder (membership) is computed view-side from
+            // `currentIndex` + this depth.
+            draggedRowDepth = resolvedDepth
             // Trackpad detent when the drop target moves (discrete — fires once
             // per row/folder/depth crossing, not per frame). Heavier across tiers.
             playDragDetent(tierChanged: tierChanged)
@@ -3744,11 +3757,17 @@ private struct MacSidebarGroup: View {
         let kind: Kind
         let depth: Int
         let folderID: UUID?   // membership of a note row (nil = standalone)
+        /// Cross-tier folder drag: placeholder row in the destination tier that
+        /// renders the landing indicator (drop bar or folder highlight gap).
+        var isCrossTierPlaceholder: Bool = false
+        var crossTierFolderID: UUID? = nil
         var rowID: UUID {
+            if isCrossTierPlaceholder, let fid = crossTierFolderID { return fid }
             switch kind { case .folderHeader(let f): return f.id; case .note(let n): return n.id }
         }
         var isFolder: Bool { if case .folderHeader = kind { return true }; return false }
         var id: String {
+            if isCrossTierPlaceholder, let fid = crossTierFolderID { return "xfolder-\(fid.uuidString)" }
             switch kind {
             case .folderHeader(let f): return "folder-\(f.id.uuidString)"
             case .note(let n): return "note-\(n.id.uuidString)"
@@ -3812,9 +3831,11 @@ private struct MacSidebarGroup: View {
     /// via per-row offsets. This keeps resting positions == on-screen positions,
     /// so the folder hit-test never drifts.
     private var usesReorderRender: Bool {
-        session.isActive
-            && (session.draggedNoteID != nil || session.draggedFolderID != nil)
-            && session.sourceTier == tier && session.currentTier == tier
+        guard session.isActive else { return false }
+        guard session.draggedNoteID != nil || session.draggedFolderID != nil else { return false }
+        // Source tier (within-tier reorder) OR destination tier of a cross-tier
+        // folder drag (show the landing gap in the destination list).
+        return session.currentTier == tier
     }
 
     /// The within-tier dragged row ids (one note/folder, or the whole multi
@@ -3825,16 +3846,38 @@ private struct MacSidebarGroup: View {
         return []
     }
 
-    /// The rendered rows: normally `flatRows`, but during a within-tier drag the
-    /// dragged row(s) are lifted and re-inserted contiguously at the resolved
-    /// slot (depth/parent), so the render == the eventual commit.
+    /// The rendered rows: normally `flatRows`, but during a drag the dragged
+    /// row(s) are lifted and re-inserted at the resolved slot so the render ==
+    /// the eventual commit. For cross-tier folder drags the dragged folder isn't
+    /// in this tier's rows; insert the drop indicator only.
     private var displayedFlatRows: [SidebarRow] {
         guard usesReorderRender else { return flatRows }
         let ids = Set(draggedRowIDs)
         guard !ids.isEmpty else { return flatRows }
         var rows = flatRows
         let movers = rows.filter { ids.contains($0.rowID) }
-        guard !movers.isEmpty else { return flatRows }
+
+        // Cross-tier folder drag: the folder lives in another tier's rows.
+        // Insert a placeholder indicator at the resolved slot so the destination
+        // shows the landing gap + folder highlight when nesting.
+        if movers.isEmpty, let fid = session.draggedFolderID {
+            let c = min(max(0, session.currentIndex), rows.count)
+            // Borrow any note's kind to form a valid row; the placeholder flag
+            // makes flatRowView render it as a drop indicator bar, not a note.
+            let dummyKind: SidebarRow.Kind
+            if let first = rows.first { dummyKind = first.kind }
+            else { return rows }    // empty tier, no gap needed (tierEndExpansion covers it)
+            let placeholder = SidebarRow(
+                kind: dummyKind,
+                depth: session.draggedRowDepth,
+                folderID: session.nestTargetFolderID,
+                isCrossTierPlaceholder: true,
+                crossTierFolderID: fid
+            )
+            rows.insert(placeholder, at: c)
+            return rows
+        }
+
         rows.removeAll { ids.contains($0.rowID) }
         let c = min(max(0, session.currentIndex), rows.count)
         let rekeyed = movers.map {
@@ -3847,6 +3890,10 @@ private struct MacSidebarGroup: View {
 
     @ViewBuilder
     private func flatRowView(_ row: SidebarRow, at index: Int) -> some View {
+        if row.isCrossTierPlaceholder {
+            // Cross-tier folder drag: drop indicator bar in the destination tier.
+            dropIndicatorRow(depth: row.depth).frame(height: nil)
+        } else {
         switch row.kind {
         case .folderHeader(let folder):
             let isDraggedFolder = session.draggedFolderID == folder.id
@@ -3900,6 +3947,7 @@ private struct MacSidebarGroup: View {
                     .simultaneousGesture(liveDragGesture(for: note, at: index))
             }
         }
+        } // end else (not cross-tier placeholder)
     }
 
     /// A thin insertion bar at `depth`'s indent — the visible placeholder for
@@ -4113,10 +4161,11 @@ private struct MacSidebarGroup: View {
                                 depth: $0.depth) }
                 }
                 session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
-                // Resolve the PARENT folder for the current (gap, depth) so the
-                // target folder highlights and the commit knows the membership.
-                if session.sourceTier == tier && session.currentTier == tier
-                    && session.draggedFolderID == nil {
+                // Resolve the PARENT folder for the current (gap, depth) — in
+                // ANY list tier, so a cross-tier drop into a folder highlights +
+                // nests too.
+                if session.draggedFolderID == nil,
+                   let ct = session.currentTier, ct == .pinned || ct == .random {
                     session.nestTargetFolderID = resolveParentFolderID(
                         gap: session.currentIndex, depth: session.draggedRowDepth)
                 } else {
@@ -4176,7 +4225,9 @@ private struct MacSidebarGroup: View {
                                 depth: $0.depth) }
                 }
                 session.updateDrag(location: value.location, translation: value.translation, rowHeight: rowHeight)
-                if session.sourceTier == tier && session.currentTier == tier {
+                // Resolve the nest target in ANY list tier (cross-tier folder drag
+                // can target a folder in the destination too, depth > 0).
+                if let ct = session.currentTier, ct == .pinned || ct == .random {
                     session.nestTargetFolderID = resolveParentFolderID(
                         gap: session.currentIndex, depth: session.draggedRowDepth)
                 } else {
@@ -4202,20 +4253,17 @@ private struct MacSidebarGroup: View {
     /// ancestor folder at `depth-1` on the previous row's chain, or nil for
     /// top-level. `gap` is an index into the resting (dragged-excluded) rows.
     private func resolveParentFolderID(gap: Int, depth d: Int) -> UUID? {
-        guard d > 0 else { return nil }
-        var dragged = Set(session.draggedNoteIDs)
-        if let fid = session.draggedFolderID { dragged.insert(fid) }
-        guard !dragged.isEmpty else { return nil }
-        let rest = flatRows.filter { !dragged.contains($0.rowID) }
-        let pi = min(gap, rest.count) - 1
-        guard pi >= 0 else { return nil }   // gap at the very top → top-level
-        var anchor: Folder?
-        switch rest[pi].kind {
-        case .folderHeader(let f): anchor = f
-        case .note(let n): anchor = n.folder
+        guard d > 0, let ct = session.currentTier else { return nil }
+        // Resolve against the RESOLVED tier's published rows so it works for a
+        // cross-tier drop too (folder header `folderID` = its own id there).
+        let rows = session.tierFolderRows[ct] ?? []
+        var i = min(gap, rows.count) - 1
+        while i >= 0 {
+            let r = rows[i]
+            if r.isFolder && r.depth == d - 1 { return r.folderID }
+            if r.depth < d - 1 { break }   // exited to a shallower container
+            i -= 1
         }
-        while let a = anchor, a.depth > d - 1 { anchor = a.parent }
-        if let a = anchor, a.depth == d - 1 { return a.id }
         return nil
     }
 
@@ -4309,6 +4357,12 @@ private struct MacSidebarGroup: View {
             // (performMove clears `folder`).
             if !crossTier && source.space?.id == destSpace.id {
                 commitWithinTierFlat(source: source, flatDropIndex: destIndex)
+            } else if dest != .favorite,
+                      let fid = session.nestTargetFolderID,
+                      let folder = try? modelContext.fetch(
+                        FetchDescriptor<Folder>(predicate: #Predicate { $0.id == fid })).first {
+                // Cross-tier / cross-space drop INTO a folder.
+                commitNoteIntoFolder(source, folder: folder)
             } else {
                 performMove(source: source, dest: dest, destIndex: destIndex, crossTier: crossTier, destSpace: destSpace)
             }
@@ -4365,9 +4419,36 @@ private struct MacSidebarGroup: View {
         }
     }
 
-    /// Reassign order counters from a desired flat row order: top-level folders
-    /// + standalone notes share one counter (interleave); each folder's child
-    /// folders and member notes get their own counters.
+    /// Cross-tier / cross-space drop of a note INTO a folder: re-tier/space the
+    /// note to the folder's, slot it among the folder's members at the resolved
+    /// position, open the folder if closed, and renumber both tiers.
+    private func commitNoteIntoFolder(_ source: Note, folder: Folder) {
+        let destTier = folder.tier
+        let destSpace = folder.space
+        source.folder = folder
+        source.tier = destTier
+        if let sp = destSpace { source.space = sp }
+        source.updatedAt = Date()
+
+        // Member insertion index = count of the folder's member rows before the
+        // resolved flat slot (in the destination tier's published rows).
+        let destRows = session.tierFolderRows[destTier] ?? []
+        let c = min(max(0, session.currentIndex), destRows.count)
+        let memberBefore = destRows.prefix(c).filter { !$0.isFolder && $0.folderID == folder.id }.count
+        var members = (folder.notes ?? []).filter { $0.id != source.id }
+            .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+        members.insert(source, at: min(max(0, memberBefore), members.count))
+        for (i, n) in members.enumerated() { n.manualSortIndex = i }
+
+        let wasCollapsed = folder.isCollapsed
+        let svc = FolderService(context: modelContext)
+        if let srcTier = session.sourceTier { try? svc.normalizeTierOrder(tier: srcTier, in: space) }
+        try? modelContext.save()
+        if wasCollapsed {
+            withAnimation(.smooth(duration: 0.22)) { try? svc.setCollapsed(folder, false) }
+        }
+    }
+
     /// One shared 0..n counter PER CONTAINER (keyed by `row.folderID`, nil =
     /// top-level) across both child folders and member notes — so they interleave
     /// and the rendered order matches the committed order exactly.
@@ -4393,10 +4474,12 @@ private struct MacSidebarGroup: View {
         guard let folder = try? modelContext.fetch(
             FetchDescriptor<Folder>(predicate: #Predicate { $0.id == folderID })).first
         else { settleFolderBack(); return }
-        // Cross-tier (Pinned ↔ Notes): move the whole subtree to the other tier
-        // at top level (favorites is excluded for folders upstream).
-        if let destTier = session.currentTier, destTier != session.sourceTier {
-            commitFolderCrossTier(folder: folder, destTier: destTier, wasExpanded: wasExpanded)
+        // Cross-tier (Pinned ↔ Notes) or cross-space: move the whole subtree to
+        // the destination tier/space at top level (favorites excluded upstream).
+        let destSpace = session.dropSpace ?? space
+        let destTier = session.currentTier ?? session.sourceTier ?? .pinned
+        if destTier != session.sourceTier || destSpace.id != space.id {
+            commitFolderMove(folder: folder, destTier: destTier, destSpace: destSpace, wasExpanded: wasExpanded)
             return
         }
 
@@ -4448,41 +4531,71 @@ private struct MacSidebarGroup: View {
         }
     }
 
-    /// Move a dragged folder's subtree to the OTHER list tier (same space), at
-    /// top level (appended), then glide the ghost to the destination.
-    private func commitFolderCrossTier(folder: Folder, destTier: NoteTier, wasExpanded: Bool) {
+    /// Move a dragged folder's subtree to another tier and/or SPACE, landing at
+    /// top level positionally, then glide the ghost to the destination.
+    private func commitFolderMove(folder: Folder, destTier: NoteTier, destSpace: Space, wasExpanded: Bool) {
         let svc = FolderService(context: modelContext)
-        try? svc.changeTier(folder, to: destTier)
-        folder.parent = nil
+        let sourceTier = session.sourceTier
+        if destSpace.id != space.id {
+            try? svc.move(folder, toTier: destTier, toSpace: destSpace)
+        } else {
+            try? svc.changeTier(folder, to: destTier)
+        }
 
-        // Map the flat drop slot to a TOP-LEVEL insertion index in the dest tier.
+        // Nest into a target folder if one was previewed (depth > 0 drop),
+        // otherwise land top-level.
+        let nestParentID = session.nestTargetFolderID
+        let nestParent = nestParentID.flatMap { id in
+            try? modelContext.fetch(FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
+        }
+        let safeParent = (nestParent != nil && svc.canNest(folder, under: nestParent)) ? nestParent : nil
+        folder.parent = safeParent
+        let wasParentCollapsed = safeParent?.isCollapsed ?? false
+
         let destRows = session.tierFolderRows[destTier] ?? []
         let c = min(max(0, session.currentIndex), destRows.count)
-        let topInsert = destRows.prefix(c).filter { $0.depth == 0 }.count
 
-        enum Item { case folder(Folder); case note(Note) }
-        func order(_ i: Item) -> Int {
-            switch i { case .folder(let f): return f.sortIndex; case .note(let n): return n.manualSortIndex ?? Int.max }
-        }
-        let spaceID = space.id
-        let destFolders = ((try? modelContext.fetch(FetchDescriptor<Folder>(predicate: #Predicate {
-            $0.space?.id == spaceID
-        }))) ?? []).filter { $0.tier == destTier && $0.parent == nil && $0.id != folder.id }
-        let destNotes = ((try? modelContext.fetch(FetchDescriptor<Note>(predicate: #Predicate {
-            $0.space?.id == spaceID
-        }))) ?? []).filter { $0.tier == destTier && $0.folder == nil }
-        var items: [Item] = (destFolders.map { Item.folder($0) } + destNotes.map { Item.note($0) })
-            .sorted { order($0) < order($1) }
-        items.insert(.folder(folder), at: min(max(0, topInsert), items.count))
-        var counter = 0
-        for it in items {
-            switch it {
-            case .folder(let f): f.sortIndex = counter
-            case .note(let n): n.manualSortIndex = counter
+        if let parent = safeParent {
+            // Nested: slot among the parent's children + member notes.
+            let memberBefore = destRows.prefix(c).filter { !$0.isFolder && $0.folderID == parent.id }.count
+            let folderBefore = destRows.prefix(c).filter { $0.isFolder && $0.folderID == parent.id }.count
+            var siblings = (parent.children ?? []).filter { $0.id != folder.id }
+                .sorted { $0.sortIndex < $1.sortIndex }
+            siblings.insert(folder, at: min(max(0, folderBefore), siblings.count))
+            for (i, f) in siblings.enumerated() { f.sortIndex = i }
+            var members = (parent.notes ?? [])
+                .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
+            _ = memberBefore  // member position handled by normalizeTierOrder below
+            _ = members
+        } else {
+            // Top-level: slot among the dest tier's top-level items.
+            let topInsert = destRows.prefix(c).filter { $0.depth == 0 }.count
+            enum Item { case folder(Folder); case note(Note) }
+            func order(_ i: Item) -> Int {
+                switch i { case .folder(let f): return f.sortIndex; case .note(let n): return n.manualSortIndex ?? Int.max }
             }
-            counter += 1
+            let destSpaceID = destSpace.id
+            let destFolders = ((try? modelContext.fetch(FetchDescriptor<Folder>(predicate: #Predicate {
+                $0.space?.id == destSpaceID
+            }))) ?? []).filter { $0.tier == destTier && $0.parent == nil && $0.id != folder.id }
+            let destNotes = ((try? modelContext.fetch(FetchDescriptor<Note>(predicate: #Predicate {
+                $0.space?.id == destSpaceID
+            }))) ?? []).filter { $0.tier == destTier && $0.folder == nil }
+            var items: [Item] = (destFolders.map { Item.folder($0) } + destNotes.map { Item.note($0) })
+                .sorted { order($0) < order($1) }
+            items.insert(.folder(folder), at: min(max(0, topInsert), items.count))
+            var counter = 0
+            for it in items {
+                switch it {
+                case .folder(let f): f.sortIndex = counter
+                case .note(let n): n.manualSortIndex = counter
+                }
+                counter += 1
+            }
         }
-        if let src = session.sourceTier { try? svc.normalizeTierOrder(tier: src, in: space) }
+
+        if let src = sourceTier { try? svc.normalizeTierOrder(tier: src, in: space) }
+        try? svc.normalizeTierOrder(tier: destTier, in: destSpace)
         try? modelContext.save()
 
         let destFrame = session.tierFrames[destTier] ?? .zero
@@ -4495,6 +4608,11 @@ private struct MacSidebarGroup: View {
             DispatchQueue.main.async {
                 var tx = Transaction(); tx.disablesAnimations = true
                 withTransaction(tx) { session.reset() }
+                if wasParentCollapsed, let safeParent {
+                    withAnimation(.smooth(duration: 0.2)) {
+                        try? svc.setCollapsed(safeParent, false)
+                    }
+                }
                 reExpandDraggedFolder(folder, wasExpanded: wasExpanded)
             }
         }
@@ -4594,16 +4712,18 @@ private struct MacSidebarGroup: View {
     private func commitMultiDrag() {
         guard let dest = session.currentTier else { wipe(); return }
         let ids = session.draggedNoteIDs
-        // Within-tier multi-drag → indent-model commit (the whole block moves to
-        // the resolved parent/depth at the drop slot).
-        if dest == session.sourceTier {
+        let destSpace = session.dropSpace ?? space
+        let crossSpace = destSpace.id != space.id
+        // Within-tier + within-space multi-drag → indent-model commit (the whole
+        // block moves to the resolved parent/depth at the drop slot).
+        if !crossSpace && dest == session.sourceTier {
             commitMultiWithinTier()
             return
         }
         // Promote the whole group INTO Essentials (a grid, not rows) — commit at
         // the grid hit-test index and let the grid reflow in (no row-glide math).
         if dest == .favorite {
-            performMoveMulti(ids: ids, dest: .favorite, destIndex: session.currentIndex)
+            performMoveMulti(ids: ids, dest: .favorite, destIndex: session.currentIndex, destSpace: destSpace)
             wipe()
             return
         }
@@ -4614,8 +4734,9 @@ private struct MacSidebarGroup: View {
         // destination — `currentIndex` is bounded by the full row count, which
         // includes the collapsed dragged rows, so an unclamped target sits too
         // low and the glide visibly stops short before the rows appear higher.
+        let destSpaceID = destSpace.id
         let destVisibleCount = allNotes.filter {
-            $0.tier == dest && $0.space?.id == space.id && $0.folder == nil && !session.isDragged($0.id)
+            $0.tier == dest && $0.space?.id == destSpaceID && $0.folder == nil && !session.isDragged($0.id)
         }.count
         let destIndex = min(rawDestIndex, destVisibleCount)
 
@@ -4637,7 +4758,7 @@ private struct MacSidebarGroup: View {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetTranslationY)
         } completion: {
-            performMoveMulti(ids: ids, dest: dest, destIndex: destIndex)
+            performMoveMulti(ids: ids, dest: dest, destIndex: destIndex, destSpace: destSpace)
             var tx = Transaction()
             tx.disablesAnimations = true
             withTransaction(tx) {
@@ -4688,21 +4809,23 @@ private struct MacSidebarGroup: View {
         }
     }
 
-    /// Move the whole dragged set to `dest` at `destIndex`, preserving the
-    /// group's relative order, and renumber any source tiers they left.
-    private func performMoveMulti(ids: [UUID], dest: NoteTier, destIndex: Int) {
+    /// Move the whole dragged set to `dest` (in `destSpace`) at `destIndex`,
+    /// preserving the group's order, and renumber any source tiers they left.
+    /// `destSpace` differs from this column's space after a cross-space drag.
+    private func performMoveMulti(ids: [UUID], dest: NoteTier, destIndex: Int, destSpace: Space) {
         let movers = ids.compactMap { id in allNotes.first { $0.id == id } }
         guard !movers.isEmpty else { return }
         for m in movers {
             m.tier = dest
-            m.space = dest == .favorite ? nil : space   // favorites are global
+            m.space = dest == .favorite ? nil : destSpace   // favorites are global
             m.folder = nil
         }
 
         // Rebuild the destination tier with the group inserted as a block.
         // (Favorites are global → match on tier alone, ignore space.)
+        let destSpaceID = destSpace.id
         let destOthers = allNotes
-            .filter { $0.tier == dest && (dest == .favorite || $0.space?.id == space.id) && $0.folder == nil && !ids.contains($0.id) }
+            .filter { $0.tier == dest && (dest == .favorite || $0.space?.id == destSpaceID) && $0.folder == nil && !ids.contains($0.id) }
             .sorted { ($0.manualSortIndex ?? Int.max) < ($1.manualSortIndex ?? Int.max) }
         var reordered = destOthers
         let insertIdx = min(max(0, destIndex), reordered.count)
