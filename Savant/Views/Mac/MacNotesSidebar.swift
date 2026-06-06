@@ -3960,22 +3960,24 @@ private struct MacSidebarGroup: View {
         guard usesReorderRender else { return flatRows }
         let ids = Set(draggedRowIDs)
         guard !ids.isEmpty else { return flatRows }
-        // Drop the at-rest "empty folder" hints during a drag: they aren't in the
-        // resolver's published rows, so leaving them in would shift the render's
-        // insertion index out of sync with `currentIndex`.
-        var rows = flatRows.filter { !$0.isEmpty }
-        let movers = rows.filter { ids.contains($0.rowID) }
+        // Keep the at-rest "empty folder" hints VISIBLE during a drag — otherwise
+        // every unrelated open empty folder looks like it collapsed. Only suppress
+        // the hint of the folder we're nesting INTO (the dragged preview row takes
+        // its place). The resolver's `currentIndex` counts non-empty rows only, so
+        // `insertionPosition` maps it past the kept hints.
+        let targetEmpty = session.nestTargetFolderID
+        var rows = flatRows.filter { row in
+            if ids.contains(row.rowID) { return false }                  // lift dragged
+            if row.isEmpty, row.folderID == targetEmpty { return false } // target's hint
+            return true
+        }
+        let movers = flatRows.filter { ids.contains($0.rowID) }
 
         // Cross-tier folder drag: the folder lives in another tier's rows.
         // Insert a placeholder indicator at the resolved slot so the destination
         // shows the landing gap + folder highlight when nesting.
         if movers.isEmpty, let fid = session.draggedFolderID {
-            let c = min(max(0, session.currentIndex), rows.count)
-            // Borrow any note's kind to form a valid row; the placeholder flag
-            // makes flatRowView render it as a drop indicator bar, not a note.
-            let dummyKind: SidebarRow.Kind
-            if let first = rows.first { dummyKind = first.kind }
-            else { return rows }    // empty tier, no gap needed (tierEndExpansion covers it)
+            guard let dummyKind = rows.first?.kind else { return rows }  // empty tier
             let placeholder = SidebarRow(
                 kind: dummyKind,
                 depth: session.draggedRowDepth,
@@ -3983,18 +3985,32 @@ private struct MacSidebarGroup: View {
                 isCrossTierPlaceholder: true,
                 crossTierFolderID: fid
             )
-            rows.insert(placeholder, at: c)
+            rows.insert(placeholder, at: insertionPosition(in: rows, forNonEmptyGap: session.currentIndex))
             return rows
         }
 
-        rows.removeAll { ids.contains($0.rowID) }
-        let c = min(max(0, session.currentIndex), rows.count)
         let rekeyed = movers.map {
             SidebarRow(kind: $0.kind, depth: session.draggedRowDepth,
                        folderID: session.nestTargetFolderID)
         }
-        rows.insert(contentsOf: rekeyed, at: c)
+        rows.insert(contentsOf: rekeyed, at: insertionPosition(in: rows, forNonEmptyGap: session.currentIndex))
         return rows
+    }
+
+    /// Translate a gap index expressed in NON-EMPTY-row terms (what the resolver
+    /// puts in `currentIndex`) into an array position in `rows`, which may still
+    /// hold render-only empty-folder hints. Lands just before the g-th non-empty
+    /// row (or at the end) so a kept hint stays with its folder, above the drop.
+    private func insertionPosition(in rows: [SidebarRow], forNonEmptyGap g: Int) -> Int {
+        let total = rows.reduce(0) { $1.isEmpty ? $0 : $0 + 1 }
+        let clamped = max(0, min(g, total))
+        if clamped == total { return rows.count }
+        var seen = 0
+        for (i, r) in rows.enumerated() where !r.isEmpty {
+            if seen == clamped { return i }
+            seen += 1
+        }
+        return rows.count
     }
 
     @ViewBuilder
