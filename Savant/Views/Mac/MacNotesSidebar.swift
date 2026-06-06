@@ -789,6 +789,11 @@ private struct MacSidebarFolderGhost: View {
 
 private struct MacSidebarFloatingGhost: View {
     @Environment(\.colorScheme) private var colorScheme
+    // First-drag coachmark: a one-time styled tooltip teaching the sideways-nest
+    // gesture. Shown once ever (per-device), only on a single-note drag in a tier
+    // that has folders to nest into.
+    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
+    @State private var showIndentCoach = false
 
     let note: Note
     let activeSpace: Space?
@@ -841,47 +846,96 @@ private struct MacSidebarFloatingGhost: View {
     }
 
     var body: some View {
-        Group {
-            if overEditor {
-                editorTileGhost
-            } else if let pair = splitPair {
-                // A split dragged FROM Essentials morphs with the drop target:
-                // the combined tile while over the grid, the row pill once it
-                // crosses into a list tier (mirrors a single tile's morph).
-                if asTile && session.sourceTier == .favorite {
-                    splitTileGhost(primary: pair.0, secondary: pair.1)
-                } else {
-                    MacSplitTabRow(primary: pair.0, secondary: pair.1,
-                                   showsSeparateIndicator: true,
+        ZStack {
+            Group {
+                if overEditor {
+                    editorTileGhost
+                } else if let pair = splitPair {
+                    // A split dragged FROM Essentials morphs with the drop target:
+                    // the combined tile while over the grid, the row pill once it
+                    // crosses into a list tier (mirrors a single tile's morph).
+                    if asTile && session.sourceTier == .favorite {
+                        splitTileGhost(primary: pair.0, secondary: pair.1)
+                    } else {
+                        MacSplitTabRow(primary: pair.0, secondary: pair.1,
+                                       showsSeparateIndicator: true,
+                                       isFocused: true, tint: spaceColor ?? .accentColor)
+                            .frame(width: rowWidth)
+                    }
+                } else if let pending = pendingPrimary {
+                    // Dragging the pending pick-mode pill: ghost mirrors the combined
+                    // primary + "choose a note" placeholder (matches the resting tab).
+                    MacSplitTabRow(primary: pending, secondary: nil,
                                    isFocused: true, tint: spaceColor ?? .accentColor)
                         .frame(width: rowWidth)
+                } else if session.isMulti {
+                    // Morphs with the drop target: a stack of tiles over Essentials,
+                    // a stack of rows over the list — so the group visibly becomes
+                    // tiles/tabs as it crosses the boundary.
+                    if asTile { multiTileStack } else { multiRowStack }
+                } else if asTile {
+                    tileGhost
+                } else if activeSpace != nil {
+                    rowGhost
                 }
-            } else if let pending = pendingPrimary {
-                // Dragging the pending pick-mode pill: ghost mirrors the combined
-                // primary + "choose a note" placeholder (matches the resting tab).
-                MacSplitTabRow(primary: pending, secondary: nil,
-                               isFocused: true, tint: spaceColor ?? .accentColor)
-                    .frame(width: rowWidth)
-            } else if session.isMulti {
-                // Morphs with the drop target: a stack of tiles over Essentials,
-                // a stack of rows over the list — so the group visibly becomes
-                // tiles/tabs as it crosses the boundary.
-                if asTile { multiTileStack } else { multiRowStack }
-            } else if asTile {
-                tileGhost
-            } else if activeSpace != nil {
-                rowGhost
+            }
+            .position(x: ghostX, y: ghostCenterY)
+            .animation(.smooth(duration: 0.16), value: overEditor)
+            // Stronger lift while "picked up" (radius 8), easing down to the
+            // resting pill's shadow during the release glide so the handoff to the
+            // real row has no shadow step. `isSettling` flips inside the commit's
+            // withAnimation, so this interpolates over the same 0.18s.
+            .shadow(color: settleShadowColor, radius: settleShadowRadius, x: 0, y: settleShadowY)
+            .allowsHitTesting(false)
+            .animation(.smooth(duration: 0.12), value: asTile)
+
+            if showIndentCoach {
+                indentCoachmark
+                    .position(x: ghostX, y: ghostCenterY + CrossTierDragSession.noteRowContentHeight / 2 + 22)
+                    .allowsHitTesting(false)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .top)))
             }
         }
-        .position(x: ghostX, y: ghostCenterY)
-        .animation(.smooth(duration: 0.16), value: overEditor)
-        // Stronger lift while "picked up" (radius 8), easing down to the
-        // resting pill's shadow during the release glide so the handoff to the
-        // real row has no shadow step. `isSettling` flips inside the commit's
-        // withAnimation, so this interpolates over the same 0.18s.
-        .shadow(color: settleShadowColor, radius: settleShadowRadius, x: 0, y: settleShadowY)
-        .allowsHitTesting(false)
-        .animation(.smooth(duration: 0.12), value: asTile)
+        .onAppear { maybeShowIndentCoach() }
+    }
+
+    /// A small, clearly-designed tooltip below the dragged card teaching the
+    /// sideways-nest gesture. Static (no motion) so it reads as guidance, not a
+    /// glitch.
+    private var indentCoachmark: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.left.and.right")
+                .font(.system(size: 11, weight: .semibold))
+            Text("Drag sideways to nest")
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.primary.opacity(0.08), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        .fixedSize()
+    }
+
+    /// Show the coachmark once, on a single-note drag that actually has folders
+    /// to nest into. Auto-hides shortly after; clearing the source on drop also
+    /// removes the whole ghost (and this overlay with it).
+    private func maybeShowIndentCoach() {
+        guard !seenIndentHint,
+              !session.isMulti, splitPair == nil, pendingPrimary == nil,
+              (session.sourceTier.flatMap { session.tierFolderRows[$0] } ?? [])
+                .contains(where: { $0.isFolder }) else { return }
+        // Delay so it appears just after the lift, not as part of the grab.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard session.draggedNoteID == note.id, !session.isSettling else { return }
+            seenIndentHint = true
+            withAnimation(.smooth(duration: 0.22)) { showIndentCoach = true }
+            // Auto-dismiss after a few seconds even if the drag lingers.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                withAnimation(.smooth(duration: 0.25)) { showIndentCoach = false }
+            }
+        }
     }
 
     /// Shadow that matches the resting row once settled: the selected pill's
@@ -1563,6 +1617,8 @@ private struct MacSpaceNotesColumn: View {
     @State private var themeOpen = false
     @State private var isRenamingSpace = false
     @State private var draftName = ""
+    // TEMP DEBUG: re-arm the first-drag indent coachmark. Remove later.
+    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1609,6 +1665,9 @@ private struct MacSpaceNotesColumn: View {
         Button { createFolderHere() } label: { Label("New Folder", systemImage: "folder.badge.plus") }
         Divider()
         Button { openManageSpaces() } label: { Label("Manage Spaces…", systemImage: "square.grid.2x2") }
+        Divider()
+        // TEMP DEBUG: re-arm the first-drag indent coachmark so it can be replayed.
+        Button { seenIndentHint = false } label: { Label("🐛 Reset indent tip", systemImage: "arrow.counterclockwise") }
         if canDeleteSpace {
             Divider()
             Button(role: .destructive) { requestDeleteSpace(space) } label: { Label("Delete Space", systemImage: "trash") }
