@@ -911,10 +911,31 @@ private struct MacSidebarFloatingGhost: View {
             // shouldn't burn the hint before it ever showed.
             guard session.draggedNoteID == note.id, !session.isSettling else { return }
             seenIndentHint = true
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { indentNudgeX = 18 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.5)) { indentNudgeX = 0 }
+            // Debug: a big, slow, multi-cycle shake so it's unmistakable. Prod:
+            // a single subtle push-and-spring-back.
+            if debugAlwaysIndentHint {
+                wiggle(cyclesLeft: 5, amplitude: 36)
+            } else {
+                withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { indentNudgeX = 18 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.5)) { indentNudgeX = 0 }
+                }
             }
+        }
+    }
+
+    /// Decaying left-right shake of the ghost (debug aid to make the wiggle
+    /// obvious). Alternates sign each cycle, shrinking the amplitude, then
+    /// settles to 0.
+    private func wiggle(cyclesLeft: Int, amplitude: CGFloat) {
+        guard cyclesLeft > 0 else {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { indentNudgeX = 0 }
+            return
+        }
+        let dir: CGFloat = cyclesLeft % 2 == 0 ? -1 : 1
+        withAnimation(.easeInOut(duration: 0.16)) { indentNudgeX = dir * amplitude }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) {
+            wiggle(cyclesLeft: cyclesLeft - 1, amplitude: amplitude * 0.78)
         }
     }
 
