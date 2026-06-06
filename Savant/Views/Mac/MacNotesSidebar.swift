@@ -1660,8 +1660,6 @@ private struct MacSpaceNotesColumn: View {
     @State private var themeOpen = false
     @State private var isRenamingSpace = false
     @State private var draftName = ""
-    // TEMP DEBUG: re-arm the first-drag indent coachmark. Remove later.
-    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1708,9 +1706,6 @@ private struct MacSpaceNotesColumn: View {
         Button { createFolderHere() } label: { Label("New Folder", systemImage: "folder.badge.plus") }
         Divider()
         Button { openManageSpaces() } label: { Label("Manage Spaces…", systemImage: "square.grid.2x2") }
-        Divider()
-        // TEMP DEBUG: re-arm the first-drag indent coachmark so it can be replayed.
-        Button { seenIndentHint = false } label: { Label("🐛 Reset indent tip", systemImage: "arrow.counterclockwise") }
         if canDeleteSpace {
             Divider()
             Button(role: .destructive) { requestDeleteSpace(space) } label: { Label("Delete Space", systemImage: "trash") }
