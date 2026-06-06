@@ -28,8 +28,8 @@ struct DropZonePlaceholder: View {
 
     private var label: String {
         switch tier {
-        case .favorite: "Drop to favorite"
-        case .pinned: "Drop to pin"
+        case .favorite: "Drop to anchor"
+        case .pinned: "Drop to keep"
         case .random: "Drop here"
         case .archived: "Archive"
         }

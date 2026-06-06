@@ -94,10 +94,10 @@ struct NoteRowView: View {
         Button("Edit", systemImage: "pencil") {
             appState.presentEdit(note)
         }
-        Button("Pin", systemImage: "pin.fill") {
+        Button("Keep", systemImage: "pin.fill") {
             update { try $0.promote(note, to: .pinned, currentSpace: currentSpace) }
         }
-        Button("Favorite", systemImage: "star.fill") {
+        Button("Anchor", systemImage: "star.fill") {
             update { try $0.promote(note, to: .favorite, currentSpace: currentSpace) }
         }
         Menu("Move to space", systemImage: "arrow.left.arrow.right") {

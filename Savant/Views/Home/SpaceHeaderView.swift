@@ -8,25 +8,29 @@ struct SpaceHeaderView: View {
     let spaces: [Space]
     let selectedIndex: Int
     let selectSpaceAtIndex: (Int) -> Void
+    /// Editorial metadata line under the title (e.g. "12 notes").
+    var subtitle: String? = nil
     let tidyNow: () -> Void
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(alignment: .leading, spacing: 12) {
             SpaceSymbolRail(spaces: spaces, selectedIndex: selectedIndex, select: selectSpaceAtIndex)
                 .frame(maxWidth: .infinity)
+                .padding(.bottom, 4)
 
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Button {
                     appState.presentedSheet = .switcher
                 } label: {
-                    HStack(spacing: 8) {
-                        Text(space.emoji)
+                    HStack(alignment: .firstTextBaseline, spacing: 9) {
+                        SpaceGlyph(value: space.emoji, size: 26)
                         Text(space.name)
-                            .font(.system(size: 34, weight: .bold, design: .rounded))
+                            .font(.system(size: 34, weight: .semibold, design: .serif))
                             .lineLimit(1)
                             .minimumScaleFactor(0.7)
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 15, weight: .bold))
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.savantSubtleInk)
                     }
                     .foregroundStyle(.savantInk)
                 }
@@ -41,26 +45,43 @@ struct SpaceHeaderView: View {
                         interaction.exitEditMode()
                     }
                     .font(.system(.body, design: .rounded).weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .frame(height: 44)
-                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .foregroundStyle(.savantInk)
+                    .buttonStyle(.plain)
                     .accessibilityIdentifier("edit-done")
                 } else {
                     headerActions
                 }
             }
+
+            if let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(.subheadline, design: .serif))
+                    .italic()
+                    .foregroundStyle(.savantSubtleInk)
+            }
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.13))
+                .frame(height: 1)
+                .padding(.top, 4)
         }
     }
 
+    // Plain, un-boxed icon actions — editorial chrome recedes; the serif
+    // identity + content carry the page. (No glass circles.)
     private var headerActions: some View {
-        HStack(spacing: 8) {
-            GlassCircleButton(
-                systemName: "magnifyingglass",
-                accessibilityLabel: "Search",
-                accessibilityIdentifier: "space-search"
-            ) {
+        HStack(spacing: 16) {
+            Button {
                 appState.presentedSheet = .search(space)
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(width: 30, height: 40)
+                    .contentShape(.rect)
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Search")
+            .accessibilityIdentifier("space-search")
 
             Menu {
                 Button("Edit notes", systemImage: "checkmark.circle") {
@@ -75,14 +96,16 @@ struct SpaceHeaderView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 17, weight: .bold))
-                    .frame(width: 48, height: 48)
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(width: 30, height: 40)
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            .glassEffect(.regular.interactive(), in: .circle)
+            .tint(.primary)
             .accessibilityLabel("More actions")
             .accessibilityIdentifier("more-actions")
         }
+        .foregroundStyle(.savantInk)
     }
 }
 
@@ -105,10 +128,9 @@ private struct SpaceSymbolRail: View {
                 Button {
                     if !active { select(index) }
                 } label: {
-                    Text(space.emoji)
-                        .font(.system(size: 18))
+                    SpaceGlyph(value: space.emoji, size: 18)
                         .grayscale(active ? 0 : 1)
-                        .opacity(active ? 1 : 0.45)
+                        .opacity(active ? 1 : 0.4)
                         .scaleEffect(active ? 1 : 0.86)
                         .frame(width: 36, height: 34)
                         .background {

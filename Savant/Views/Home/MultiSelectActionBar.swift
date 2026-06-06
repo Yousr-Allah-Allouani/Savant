@@ -13,10 +13,10 @@ struct MultiSelectActionBar: View {
         let selected = selectedNotes
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                ActionButton(systemName: "star.fill", label: "Favorite") {
+                ActionButton(systemName: "star.fill", label: "Anchor") {
                     bulk { try $0.promote($1, to: .favorite, currentSpace: space) }
                 }
-                ActionButton(systemName: "pin.fill", label: "Pin") {
+                ActionButton(systemName: "pin.fill", label: "Keep") {
                     bulk { try $0.promote($1, to: .pinned, currentSpace: space) }
                 }
                 Menu {

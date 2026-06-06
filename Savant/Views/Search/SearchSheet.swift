@@ -102,7 +102,7 @@ private struct SearchResultRow: View {
                         .padding(.vertical, 4)
                         .background(Color(hex: space.colorHex).opacity(0.35), in: .capsule)
                 } else if note.tier == .favorite {
-                    Text("Favorite")
+                    Text("Anchor")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)

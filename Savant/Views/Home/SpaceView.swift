@@ -12,6 +12,7 @@ struct SpaceView: View {
     let latestTidyRun: TidyRun?
     let selectedIndex: Int
     let selectSpaceAtIndex: (Int) -> Void
+    var topInset: CGFloat = 0
     let tidyNow: () -> Void
 
     var body: some View {
@@ -24,9 +25,10 @@ struct SpaceView: View {
                             spaces: spaces,
                             selectedIndex: selectedIndex,
                             selectSpaceAtIndex: selectSpaceAtIndex,
+                            subtitle: noteCountSubtitle,
                             tidyNow: tidyNow
                         )
-                        .padding(.top, 18)
+                        .padding(.top, topInset + 10)
 
                         if let latestTidyRun, !interaction.isEditing {
                             TidyBannerView(run: latestTidyRun)
@@ -62,17 +64,15 @@ struct SpaceView: View {
     }
 
     private var contentSections: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // Editorial: generous air between tiers carries the separation — no
+        // divider rules between sections.
+        VStack(alignment: .leading, spacing: 28) {
             FavoritesTileRow(
                 notes: favoriteNotes,
                 allNotes: notes,
                 spaces: spaces,
                 currentSpace: space
             )
-
-            if shouldShowPinnedDivider, !interaction.isDragging {
-                SectionDivider()
-            }
 
             PinnedSection(
                 folders: pinnedFolders,
@@ -82,10 +82,6 @@ struct SpaceView: View {
                 spaces: spaces,
                 currentSpace: space
             )
-
-            if shouldShowRandomDivider, !interaction.isDragging {
-                SectionDivider()
-            }
 
             RandomSection(
                 folders: randomFolders,
@@ -99,12 +95,14 @@ struct SpaceView: View {
         }
     }
 
-    private var shouldShowPinnedDivider: Bool {
-        !favoriteNotes.isEmpty && (!pinnedNotes.isEmpty || !pinnedFolders.isEmpty || !randomNotes.isEmpty || !randomFolders.isEmpty)
-    }
-
-    private var shouldShowRandomDivider: Bool {
-        (!pinnedNotes.isEmpty || !pinnedFolders.isEmpty) && (!randomNotes.isEmpty || !randomFolders.isEmpty)
+    /// Editorial metadata subhead under the space title.
+    private var noteCountSubtitle: String {
+        let count = favoriteNotes.count + pinnedNotes.count + randomNotes.count
+        switch count {
+        case 0: return "Empty — capture below"
+        case 1: return "1 note"
+        default: return "\(count) notes"
+        }
     }
 
     private var favoriteNotes: [Note] {

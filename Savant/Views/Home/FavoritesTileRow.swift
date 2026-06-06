@@ -1,8 +1,10 @@
 import SwiftData
 import SwiftUI
 
+/// Anchors — the global top tier. Editorial direction: a clean starred list on
+/// the open color, not glass tiles. (Kept the filename/type so call sites and
+/// the project file don't churn.)
 struct FavoritesTileRow: View {
-    @Environment(AppState.self) private var appState
     @Environment(InteractionMode.self) private var interaction
     @Environment(\.modelContext) private var modelContext
 
@@ -20,20 +22,9 @@ struct FavoritesTileRow: View {
         if isEmpty && !dragActive {
             EmptyView()
         } else {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("Favorites")
-                        .font(.system(.caption, design: .rounded).weight(.semibold))
-                        .foregroundStyle(.savantSubtleInk)
-                        .textCase(.uppercase)
-                    if dragActive {
-                        Text("• drop to favorite")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(.secondary)
-                            .transition(.opacity)
-                    }
-                    Spacer()
-                }
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(title: "Anchors", count: notes.count,
+                             hint: dragActive ? "drop to anchor" : nil)
 
                 if isEmpty && dragActive {
                     DropZonePlaceholder(tier: .favorite, isTargeted: isTargeted)
@@ -41,37 +32,19 @@ struct FavoritesTileRow: View {
                             handleDrop(items)
                         } isTargeted: { isTargeted = $0 }
                 } else {
-                    tilesGroup
-                        .dropZoneAura(active: dragActive, targeted: isTargeted, cornerRadius: 20)
-                        .dropDestination(for: DraggedItemTransfer.self) { items, _ in
-                            handleDrop(items)
-                        } isTargeted: { isTargeted = $0 }
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(notes) { note in
+                            AnchorRow(note: note, spaces: spaces, currentSpace: currentSpace)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .dropZoneAura(active: dragActive, targeted: isTargeted, cornerRadius: 14)
+                    .dropDestination(for: DraggedItemTransfer.self) { items, _ in
+                        handleDrop(items)
+                    } isTargeted: { isTargeted = $0 }
                 }
             }
             .animation(.easeOut(duration: 0.18), value: dragActive)
-        }
-    }
-
-    @ViewBuilder private var tilesGroup: some View {
-        if notes.count == 1, let note = notes.first {
-            FavoriteTile(note: note, style: .large, spaces: spaces, currentSpace: currentSpace)
-        } else if notes.count == 2 {
-            HStack(spacing: 10) {
-                ForEach(notes) { note in
-                    FavoriteTile(note: note, style: .medium, spaces: spaces, currentSpace: currentSpace)
-                }
-            }
-        } else {
-            ScrollView(.horizontal) {
-                HStack(spacing: 10) {
-                    ForEach(notes) { note in
-                        FavoriteTile(note: note, style: .compact, spaces: spaces, currentSpace: currentSpace)
-                            .frame(width: 150)
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-            .scrollIndicators(.hidden)
         }
     }
 
@@ -83,77 +56,60 @@ struct FavoritesTileRow: View {
             try service.promote(note, to: .favorite, currentSpace: currentSpace)
             return true
         } catch {
-            assertionFailure("Favorite drop failed: \(error)")
+            assertionFailure("Anchor drop failed: \(error)")
             return false
         }
     }
 }
 
-private enum FavoriteTileStyle {
-    case large
-    case medium
-    case compact
-}
-
-private struct FavoriteTile: View {
+/// A single Anchor as an editorial list row: a small star mark + the title on
+/// the open color. Mirrors the Kept/Stream row rhythm so the whole page reads
+/// as one typographic list, distinguished only by the star.
+private struct AnchorRow: View {
     @Environment(AppState.self) private var appState
     @Environment(InteractionMode.self) private var interaction
     @Environment(\.modelContext) private var modelContext
 
     let note: Note
-    let style: FavoriteTileStyle
     let spaces: [Space]
     let currentSpace: Space
 
     var body: some View {
-        tileContent
-            .padding(16)
-            .frame(maxWidth: .infinity, minHeight: style == .large ? 130 : 112, alignment: .topLeading)
-            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
-            .contentShape(.rect(cornerRadius: 18))
-            .onTapGesture(count: 2) { appState.presentEdit(note) }
-            .onTapGesture { appState.presentRead(note) }
-            .draggable(DraggedItemTransfer.note(note.id)) {
-                NoteDragPreview(note: note)
-                    .dragLifecycleHook(interaction)
+        HStack(alignment: .firstTextBaseline, spacing: 11) {
+            Image(systemName: "star.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.savantSubtleInk)
+            Text(note.title)
+                .font(.system(.body, design: .rounded).weight(.medium))
+                .foregroundStyle(.savantInk)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 8)
+        .contentShape(.rect)
+        .onTapGesture(count: 2) { appState.presentEdit(note) }
+        .onTapGesture { appState.presentRead(note) }
+        .draggable(DraggedItemTransfer.note(note.id)) {
+            NoteDragPreview(note: note)
+                .dragLifecycleHook(interaction)
+        }
+        .contextMenu {
+            Button("Edit", systemImage: "pencil") { appState.presentEdit(note) }
+            Button("Remove from Anchors", systemImage: "star.slash") {
+                update { try $0.promote(note, to: .pinned, currentSpace: currentSpace) }
             }
-            .contextMenu {
-                Button("Edit", systemImage: "pencil") { appState.presentEdit(note) }
-                Button("Unfavorite", systemImage: "star.slash") {
-                    update { try $0.promote(note, to: .pinned, currentSpace: currentSpace) }
-                }
-                Menu("Move to space", systemImage: "arrow.left.arrow.right") {
-                    ForEach(spaces) { space in
-                        Button("\(space.emoji) \(space.name)") {
-                            update { try $0.move(note, to: space) }
-                        }
+            Menu("Move to space", systemImage: "arrow.left.arrow.right") {
+                ForEach(spaces) { space in
+                    Button("\(space.emoji) \(space.name)") {
+                        update { try $0.move(note, to: space) }
                     }
                 }
-                Button("Archive", systemImage: "archivebox") {
-                    update { try $0.archive(note) }
-                }
-                Button("Delete", systemImage: "trash", role: .destructive) {
-                    update { try $0.delete(note) }
-                }
             }
-    }
-
-    @ViewBuilder private var tileContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "star.fill")
-                    .font(.caption)
-                Text(note.title)
-                    .font(.system(style == .large ? .title3 : .body, design: .rounded).weight(.semibold))
-                    .lineLimit(style == .large ? 2 : 1)
-                    .minimumScaleFactor(0.82)
-                Spacer(minLength: 0)
+            Button("Archive", systemImage: "archivebox") {
+                update { try $0.archive(note) }
             }
-            if style != .compact {
-                Text(note.bodyMarkdown.isEmpty ? "No body yet" : note.bodyMarkdown)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(style == .large ? 4 : 2)
+            Button("Delete", systemImage: "trash", role: .destructive) {
+                update { try $0.delete(note) }
             }
         }
     }
@@ -162,7 +118,7 @@ private struct FavoriteTile: View {
         do {
             try work(NoteService(context: modelContext))
         } catch {
-            assertionFailure("Tile action failed: \(error)")
+            assertionFailure("Anchor action failed: \(error)")
         }
     }
 }

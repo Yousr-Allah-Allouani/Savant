@@ -21,18 +21,8 @@ struct RandomSection: View {
         let isEmpty = folders.isEmpty && notes.isEmpty
 
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Random")
-                    .font(.system(.caption, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.savantSubtleInk)
-                    .textCase(.uppercase)
-                if dragActive {
-                    Text("• drop to demote")
-                        .font(.system(.caption, design: .rounded))
-                        .foregroundStyle(.secondary)
-                        .transition(.opacity)
-                }
-                Spacer()
+            SectionLabel(title: "Stream", count: notes.count + folders.count,
+                         hint: dragActive ? "drop to stream" : nil) {
                 if !notes.isEmpty && !dragActive {
                     Button(action: tidyNow) {
                         Label("Tidy", systemImage: "sparkles")

@@ -23,19 +23,8 @@ struct PinnedSection: View {
             EmptyView()
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Pinned")
-                        .font(.system(.caption, design: .rounded).weight(.semibold))
-                        .foregroundStyle(.savantSubtleInk)
-                        .textCase(.uppercase)
-                    if dragActive {
-                        Text("• drop to pin")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(.secondary)
-                            .transition(.opacity)
-                    }
-                    Spacer()
-                }
+                SectionLabel(title: "Kept", count: folders.count + notes.count,
+                             hint: dragActive ? "drop to keep" : nil)
 
                 if isEmpty && dragActive {
                     DropZonePlaceholder(tier: .pinned, isTargeted: isTargeted)

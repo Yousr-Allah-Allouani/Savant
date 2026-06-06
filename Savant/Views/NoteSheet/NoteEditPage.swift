@@ -76,10 +76,10 @@ struct NoteEditPage: View {
                         Button(showsMarkdownSource ? "Hide markdown source" : "Show markdown source", systemImage: "text.alignleft") {
                             showsMarkdownSource.toggle()
                         }
-                        Button("Pin", systemImage: "pin.fill") {
+                        Button("Keep", systemImage: "pin.fill") {
                             saveThen { try NoteService(context: modelContext).promote(note, to: .pinned, currentSpace: note.space) }
                         }
-                        Button("Favorite", systemImage: "star.fill") {
+                        Button("Anchor", systemImage: "star.fill") {
                             saveThen { try NoteService(context: modelContext).promote(note, to: .favorite, currentSpace: note.space) }
                         }
                         Button("Archive", systemImage: "archivebox") {
