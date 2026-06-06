@@ -2777,7 +2777,7 @@ private struct MacEssentialsRow: View {
         // Match the grid's reflow curve (0.18) so the ghost and any
         // settling tiles move in lockstep instead of arriving at
         // different times.
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(
                 width: dest == .favorite ? targetTranslationX : 0,
@@ -2839,7 +2839,7 @@ private struct MacEssentialsRow: View {
     /// animation (so `@Query` repaints the real pill/tile before the ghost is
     /// removed — clean handoff, no flash).
     private func settleSplitTile(to target: CGSize) {
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = target
         } completion: {
@@ -2928,7 +2928,7 @@ private struct MacEssentialsRow: View {
             + CrossTierDragSession.noteRowContentHeight / 2
         let targetTranslationY = primaryTargetCenterY - session.sourceRowCenter.y
 
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetTranslationY)
         } completion: {
@@ -3038,6 +3038,11 @@ final class CrossTierDragSession {
     /// top-level, else the folder it will nest into at the current depth. Drives
     /// the folder highlight + the commit's membership.
     var nestTargetFolderID: UUID? = nil
+    /// Folders spring-loaded open mid-drag (the ghost dwelled over a collapsed
+    /// folder), mapped to their member count at expand time. On drag end the
+    /// sidebar collapses back only the ones nothing was dropped into (count
+    /// unchanged). Survives `reset()` — drained by the group's drag-end handler.
+    @ObservationIgnored var autoExpandedDuringDrag: [UUID: Int] = [:]
     /// Cursor X (notes-column coords) at grab + the dragged row's depth at grab,
     /// so the live depth is steered relative to where you started.
     @ObservationIgnored var dragStartCursorX: CGFloat = 0
@@ -3157,6 +3162,16 @@ final class CrossTierDragSession {
     // Grid layout constants for the Essentials section.
     static let noteRowHeight: CGFloat = 35 // 32pt row + 3pt spacing
     static let noteRowContentHeight: CGFloat = 32 // visible row (excludes the 3pt gap)
+
+    // Shared drag-system animation curves — keep the sidebar's drag feel
+    // coherent. `commitGlide` is the settle/commit motion (the ghost gliding to
+    // its slot); `rowShuffle` is the faster live reflow + drop-target highlight;
+    // `folderToggle` is the collapse/expand chevron. Use these everywhere in the
+    // folders/notes drag system instead of ad-hoc literals.
+    static let commitGlide = Animation.smooth(duration: 0.18)
+    static let rowShuffle = Animation.smooth(duration: 0.14)
+    static let folderToggle = Animation.smooth(duration: 0.2)
+
     static let favoriteCellSpacing: CGFloat = 7
     static let favoriteCellHeight: CGFloat = 82 // 66 minHeight + 16 padding
 
@@ -3598,7 +3613,7 @@ private struct MacSpaceHeaderView<MenuItems: View>: View {
             if now { renameFocused = true }
         }
         .animation(.easeOut(duration: 0.12), value: isHovering)
-        .animation(.smooth(duration: 0.14), value: isDropTarget)
+        .animation(CrossTierDragSession.rowShuffle, value: isDropTarget)
     }
 }
 
@@ -3638,6 +3653,8 @@ private struct MacSidebarGroup: View {
     // when this column becomes the active one (even when its layout
     // didn't change — e.g., the very first time it appears active).
     @State private var lastMeasuredFrame: CGRect = .zero
+    // Spring-load: dwell timer that opens a collapsed folder the ghost hovers.
+    @State private var springTask: Task<Void, Never>? = nil
 
     private var spaceColor: Color {
         Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
@@ -3658,7 +3675,7 @@ private struct MacSidebarGroup: View {
             // the dragged row's opacity reveal as the ghost hands off (the
             // subtle residual movement). With the param nil while inactive,
             // the settle frame is instant.
-            .animation(session.isActive ? .smooth(duration: 0.14) : nil,
+            .animation(session.isActive ? CrossTierDragSession.rowShuffle : nil,
                        value: dragSignature)
 
             tierEndDropZone
@@ -3705,6 +3722,64 @@ private struct MacSidebarGroup: View {
                 }
             }
         }
+        // Spring-load: dwell ~0.4s over a collapsed folder → open it so you can
+        // see/drop inside. The target is whatever folder the ghost is nesting
+        // into; a change restarts the timer.
+        .onChange(of: session.nestTargetFolderID) { _, newID in
+            handleSpringLoad(newID)
+        }
+        // Drag end → cancel any pending open + collapse back folders nothing
+        // landed in.
+        .onChange(of: session.isActive) { _, active in
+            if !active {
+                springTask?.cancel(); springTask = nil
+                drainAutoExpanded()
+            }
+        }
+    }
+
+    /// Look up a folder by id, but only if it lives in THIS group's tier+space —
+    /// so each tier's group handles only its own spring-load / collapse-back.
+    private func folderInThisTier(_ id: UUID) -> Folder? {
+        guard let f = try? modelContext.fetch(
+            FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first,
+              f.tier == tier, f.space?.id == space.id else { return nil }
+        return f
+    }
+
+    /// Start (or restart) the dwell timer toward `targetID`. Fires only if the
+    /// target is a collapsed folder in this tier and the ghost stays on it.
+    private func handleSpringLoad(_ targetID: UUID?) {
+        springTask?.cancel(); springTask = nil
+        guard session.isActive, isActiveSpace, let fid = targetID,
+              let folder = folderInThisTier(fid), folder.isCollapsed else { return }
+        springTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled, session.isActive,
+                  session.nestTargetFolderID == fid, folder.isCollapsed else { return }
+            session.autoExpandedDuringDrag[fid] = (folder.notes ?? []).count
+            withAnimation(CrossTierDragSession.folderToggle) {
+                try? FolderService(context: modelContext).setCollapsed(folder, false)
+            }
+            // Republish so the resolver sees the freshly revealed member rows.
+            publishTierRows()
+        }
+    }
+
+    /// On drag end, collapse back each spring-loaded folder in this tier that
+    /// nothing was dropped into (its member count didn't grow).
+    private func drainAutoExpanded() {
+        guard !session.autoExpandedDuringDrag.isEmpty else { return }
+        let svc = FolderService(context: modelContext)
+        for (fid, priorCount) in session.autoExpandedDuringDrag {   // snapshot copy
+            guard let folder = folderInThisTier(fid) else { continue }
+            if (folder.notes ?? []).count <= priorCount {
+                withAnimation(CrossTierDragSession.folderToggle) {
+                    try? svc.setCollapsed(folder, true)
+                }
+            }
+            session.autoExpandedDuringDrag.removeValue(forKey: fid)
+        }
     }
 
     /// Publish this tier's resting rows (minus any dragged items that belong to
@@ -3715,7 +3790,7 @@ private struct MacSidebarGroup: View {
         var dragged = Set(session.draggedNoteIDs)
         if let fid = session.draggedFolderID { dragged.insert(fid) }
         session.tierFolderRows[tier] = flatRows
-            .filter { !dragged.contains($0.rowID) }
+            .filter { !dragged.contains($0.rowID) && !$0.isEmpty }
             .map { (isFolder: $0.isFolder,
                     folderID: $0.isFolder ? $0.rowID : $0.folderID,
                     depth: $0.depth) }
@@ -3753,7 +3828,10 @@ private struct MacSidebarGroup: View {
     private static let folderIndentStep: CGFloat = 14
 
     struct SidebarRow: Identifiable {
-        enum Kind { case folderHeader(Folder); case note(Note) }
+        // `.empty` is a render-only "this folder has no notes" hint shown at rest
+        // inside an expanded empty folder; it's stripped during drag and excluded
+        // from the resolver so it never shifts drop indices.
+        enum Kind { case folderHeader(Folder); case note(Note); case empty(folderID: UUID) }
         let kind: Kind
         let depth: Int
         let folderID: UUID?   // membership of a note row (nil = standalone)
@@ -3761,9 +3839,14 @@ private struct MacSidebarGroup: View {
         /// renders the landing indicator (drop bar or folder highlight gap).
         var isCrossTierPlaceholder: Bool = false
         var crossTierFolderID: UUID? = nil
+        var isEmpty: Bool { if case .empty = kind { return true }; return false }
         var rowID: UUID {
             if isCrossTierPlaceholder, let fid = crossTierFolderID { return fid }
-            switch kind { case .folderHeader(let f): return f.id; case .note(let n): return n.id }
+            switch kind {
+            case .folderHeader(let f): return f.id
+            case .note(let n): return n.id
+            case .empty(let fid): return fid
+            }
         }
         var isFolder: Bool { if case .folderHeader = kind { return true }; return false }
         var id: String {
@@ -3771,6 +3854,7 @@ private struct MacSidebarGroup: View {
             switch kind {
             case .folderHeader(let f): return "folder-\(f.id.uuidString)"
             case .note(let n): return "note-\(n.id.uuidString)"
+            case .empty(let fid): return "empty-\(fid.uuidString)"
             }
         }
     }
@@ -3815,6 +3899,12 @@ private struct MacSidebarGroup: View {
         }
         var items: [Item] = (f.children ?? []).map { .folder($0) } + (f.notes ?? []).map { .note($0) }
         items.sort { order($0) != order($1) ? order($0) < order($1) : created($0) < created($1) }
+        // Expanded but empty → a faint "no notes" hint so it reads as an open
+        // container (and a visible drop target). Render-only; see SidebarRow.empty.
+        if items.isEmpty {
+            rows.append(SidebarRow(kind: .empty(folderID: f.id), depth: depth, folderID: f.id))
+            return
+        }
         for item in items {
             switch item {
             case .note(let n):
@@ -3854,7 +3944,10 @@ private struct MacSidebarGroup: View {
         guard usesReorderRender else { return flatRows }
         let ids = Set(draggedRowIDs)
         guard !ids.isEmpty else { return flatRows }
-        var rows = flatRows
+        // Drop the at-rest "empty folder" hints during a drag: they aren't in the
+        // resolver's published rows, so leaving them in would shift the render's
+        // insertion index out of sync with `currentIndex`.
+        var rows = flatRows.filter { !$0.isEmpty }
         let movers = rows.filter { ids.contains($0.rowID) }
 
         // Cross-tier folder drag: the folder lives in another tier's rows.
@@ -3893,6 +3986,8 @@ private struct MacSidebarGroup: View {
         if row.isCrossTierPlaceholder {
             // Cross-tier folder drag: drop indicator bar in the destination tier.
             dropIndicatorRow(depth: row.depth).frame(height: nil)
+        } else if case .empty = row.kind {
+            emptyFolderHintRow(depth: row.depth)
         } else {
         switch row.kind {
         case .folderHeader(let folder):
@@ -3946,8 +4041,26 @@ private struct MacSidebarGroup: View {
                     .offset(y: usesReorderRender ? 0 : offset(forIndex: index))
                     .simultaneousGesture(liveDragGesture(for: note, at: index))
             }
+        case .empty:
+            // Handled by the outer branch; unreachable, here for exhaustiveness.
+            EmptyView()
         }
         } // end else (not cross-tier placeholder)
+    }
+
+    /// Faint "no notes" line shown inside an expanded empty folder. Same 32pt
+    /// content pitch as a note row so the uniform-row geometry is preserved.
+    private func emptyFolderHintRow(depth: Int) -> some View {
+        HStack(spacing: 0) {
+            Text("Empty")
+                .font(.system(size: 12, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.55))
+            Spacer(minLength: 0)
+        }
+        .frame(height: CrossTierDragSession.noteRowContentHeight)
+        .padding(.leading, CGFloat(depth) * Self.folderIndentStep + 12)
+        .padding(.trailing, 10)
+        .allowsHitTesting(false)
     }
 
     /// A thin insertion bar at `depth`'s indent — the visible placeholder for
@@ -4344,7 +4457,7 @@ private struct MacSidebarGroup: View {
         let targetTranslationX = targetCenterX - session.sourceRowCenter.x
         let targetTranslationY = targetCenterY - session.sourceRowCenter.y
 
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(
                 width: dest == .favorite ? targetTranslationX : 0,
@@ -4413,7 +4526,7 @@ private struct MacSidebarGroup: View {
         renumber(rows)
         try? modelContext.save()
         if wasCollapsed, let parent {
-            withAnimation(.smooth(duration: 0.22)) {
+            withAnimation(CrossTierDragSession.folderToggle) {
                 try? FolderService(context: modelContext).setCollapsed(parent, false)
             }
         }
@@ -4445,7 +4558,7 @@ private struct MacSidebarGroup: View {
         if let srcTier = session.sourceTier { try? svc.normalizeTierOrder(tier: srcTier, in: space) }
         try? modelContext.save()
         if wasCollapsed {
-            withAnimation(.smooth(duration: 0.22)) { try? svc.setCollapsed(folder, false) }
+            withAnimation(CrossTierDragSession.folderToggle) { try? svc.setCollapsed(folder, false) }
         }
     }
 
@@ -4455,12 +4568,14 @@ private struct MacSidebarGroup: View {
     private func renumber(_ rows: [SidebarRow]) {
         var counter: [String: Int] = [:]
         for row in rows {
+            if row.isEmpty { continue }   // render-only hint, no order to assign
             let key = row.folderID?.uuidString ?? "_top"
             let v = counter[key] ?? 0
             counter[key] = v + 1
             switch row.kind {
             case .note(let n): n.manualSortIndex = v
             case .folderHeader(let f): f.sortIndex = v
+            case .empty: break
             }
         }
     }
@@ -4512,7 +4627,7 @@ private struct MacSidebarGroup: View {
         let targetCenterY = target?.y
             ?? (destFrame.minY + CGFloat(session.currentIndex) * rowHeight
                 + CrossTierDragSession.noteRowContentHeight / 2)
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
         } completion: {
@@ -4522,7 +4637,7 @@ private struct MacSidebarGroup: View {
                 // Re-open the moved folder (and its new parent if it was closed)
                 // as a separate chevron animation, decoupled from the drag.
                 if wasParentCollapsed, let safeParent {
-                    withAnimation(.smooth(duration: 0.2)) {
+                    withAnimation(CrossTierDragSession.folderToggle) {
                         try? FolderService(context: modelContext).setCollapsed(safeParent, false)
                     }
                 }
@@ -4601,7 +4716,7 @@ private struct MacSidebarGroup: View {
         let destFrame = session.tierFrames[destTier] ?? .zero
         let targetCenterY = destFrame.minY + CGFloat(c) * rowHeight
             + CrossTierDragSession.noteRowContentHeight / 2
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
         } completion: {
@@ -4609,7 +4724,7 @@ private struct MacSidebarGroup: View {
                 var tx = Transaction(); tx.disablesAnimations = true
                 withTransaction(tx) { session.reset() }
                 if wasParentCollapsed, let safeParent {
-                    withAnimation(.smooth(duration: 0.2)) {
+                    withAnimation(CrossTierDragSession.folderToggle) {
                         try? svc.setCollapsed(safeParent, false)
                     }
                 }
@@ -4625,7 +4740,7 @@ private struct MacSidebarGroup: View {
             try? modelContext.fetch(
                 FetchDescriptor<Folder>(predicate: #Predicate { $0.id == id })).first
         }
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = .zero
         } completion: {
@@ -4639,7 +4754,7 @@ private struct MacSidebarGroup: View {
 
     private func reExpandDraggedFolder(_ folder: Folder?, wasExpanded: Bool) {
         guard wasExpanded, let folder else { return }
-        withAnimation(.smooth(duration: 0.2)) {
+        withAnimation(CrossTierDragSession.folderToggle) {
             try? FolderService(context: modelContext).setCollapsed(folder, false)
         }
     }
@@ -4754,7 +4869,7 @@ private struct MacSidebarGroup: View {
         // reset to a later runloop made the ghost sit at the target for a
         // frame or more (waiting on the @Query refresh of N notes) before the
         // real rows appeared, which read as a "stop" at the end of the snap.
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetTranslationY)
         } completion: {
@@ -4803,7 +4918,7 @@ private struct MacSidebarGroup: View {
         let primarySlot = session.currentIndex + session.primaryGroupIndex
         let targetCenterY = destFrame.minY + CGFloat(primarySlot) * rowHeight
             + CrossTierDragSession.noteRowContentHeight / 2
-        withAnimation(.smooth(duration: 0.18)) {
+        withAnimation(CrossTierDragSession.commitGlide) {
             session.isSettling = true
             session.translation = CGSize(width: 0, height: targetCenterY - session.sourceRowCenter.y)
         } completion: {
@@ -4811,7 +4926,7 @@ private struct MacSidebarGroup: View {
                 var tx = Transaction(); tx.disablesAnimations = true
                 withTransaction(tx) { session.reset() }
                 if wasCollapsed, let parent {
-                    withAnimation(.smooth(duration: 0.2)) {
+                    withAnimation(CrossTierDragSession.folderToggle) {
                         try? FolderService(context: modelContext).setCollapsed(parent, false)
                     }
                 }
@@ -4903,8 +5018,28 @@ private struct MacSidebarGroup: View {
             // Gated on `isActive` so the spacer collapses instantly on release
             // (the transaction-independent animation would otherwise slide the
             // rows below it shut over 0.14s — residual movement after the drop).
-            .animation(session.isActive ? .smooth(duration: 0.14) : nil, value: tierEndExpansion)
-            .animation(session.isActive ? .smooth(duration: 0.14) : nil, value: tierEndContraction)
+            .animation(session.isActive ? CrossTierDragSession.rowShuffle : nil, value: tierEndExpansion)
+            .animation(session.isActive ? CrossTierDragSession.rowShuffle : nil, value: tierEndContraction)
+            // Right-click the empty area below a section → make a folder IN that
+            // section's tier (the toolbar / space-menu "New Folder" are space-level
+            // and default to Pinned; this is the only Notes-tier entry point).
+            .contentShape(Rectangle())
+            .contextMenu {
+                Button {
+                    createFolderInThisTier()
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+            }
+    }
+
+    /// Create a top-level folder in THIS group's tier and enter inline rename —
+    /// so a right-click in the Notes section yields a Notes folder (not Pinned).
+    private func createFolderInThisTier() {
+        if let folder = try? FolderService(context: modelContext)
+            .create(in: space, tier: tier, parent: nil) {
+            renamingFolderID = folder.id
+        }
     }
 }
 
@@ -5002,7 +5137,7 @@ private struct MacFolderRow: View {
         .background {
             RoundedRectangle(cornerRadius: 7, style: .continuous).fill(headerFillColor)
         }
-        .animation(.smooth(duration: 0.14), value: isNestTarget)
+        .animation(CrossTierDragSession.rowShuffle, value: isNestTarget)
         .padding(.leading, CGFloat(depth) * indentStep)
         .onTapGesture { if !isRenaming { toggleExpanded() } }
         .onHover { isHovering = $0 }
@@ -5057,7 +5192,7 @@ private struct MacFolderRow: View {
     }
 
     private func toggleExpanded() {
-        withAnimation(.smooth(duration: 0.16)) {
+        withAnimation(CrossTierDragSession.folderToggle) {
             try? FolderService(context: modelContext).setCollapsed(folder, !folder.isCollapsed)
         }
     }
