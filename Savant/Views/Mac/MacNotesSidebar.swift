@@ -831,9 +831,9 @@ private struct IndentCoachmark: View {
                 // phaseAnimator loops on its own (no onAppear/withAnimation, which
                 // the entry transition was swallowing), so the arrow reliably
                 // glides left↔right the whole time the tip is up.
-                .phaseAnimator([-4.0, 4.0]) { view, x in
+                .phaseAnimator([-2.0, 2.0]) { view, x in
                     view.offset(x: x)
-                } animation: { _ in .easeInOut(duration: 0.6) }
+                } animation: { _ in .easeInOut(duration: 0.85) }
             Text("Drag sideways to nest")
                 .font(.system(size: 11, weight: .medium, design: .rounded))
         }
