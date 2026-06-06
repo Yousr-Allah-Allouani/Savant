@@ -789,6 +789,11 @@ private struct MacSidebarFolderGhost: View {
 
 private struct MacSidebarFloatingGhost: View {
     @Environment(\.colorScheme) private var colorScheme
+    // One-time "you can drag sideways to nest" hint: the first time the user
+    // ever drags a note in a tier that HAS folders, the ghost does a small
+    // rightward wiggle, then never again.
+    @AppStorage("savant.seenIndentHint") private var seenIndentHint = false
+    @State private var indentNudgeX: CGFloat = 0
 
     let note: Note
     let activeSpace: Space?
@@ -874,6 +879,8 @@ private struct MacSidebarFloatingGhost: View {
             }
         }
         .position(x: ghostX, y: ghostCenterY)
+        .offset(x: indentNudgeX)
+        .onAppear { playIndentHintIfNeeded() }
         .animation(.smooth(duration: 0.16), value: overEditor)
         // Stronger lift while "picked up" (radius 8), easing down to the
         // resting pill's shadow during the release glide so the handoff to the
@@ -882,6 +889,30 @@ private struct MacSidebarFloatingGhost: View {
         .shadow(color: settleShadowColor, radius: settleShadowRadius, x: 0, y: settleShadowY)
         .allowsHitTesting(false)
         .animation(.smooth(duration: 0.12), value: asTile)
+    }
+
+    /// First-ever note drag in a tier that has folders → a small rightward
+    /// wiggle of the ghost reveals the horizontal-indent (nest) gesture. The
+    /// spring overshoots back past zero, so one push reads as a wiggle. Gated to
+    /// single-note drags with somewhere to nest; if there are no folders yet we
+    /// DON'T spend the one-shot (it'll fire on a later drag once folders exist).
+    private func playIndentHintIfNeeded() {
+        guard !seenIndentHint,
+              !session.isMulti, splitPair == nil, pendingPrimary == nil else { return }
+        let hasFolders = (session.sourceTier.flatMap { session.tierFolderRows[$0] } ?? [])
+            .contains { $0.isFolder }
+        guard hasFolders else { return }
+        // Brief delay so it reads as a hint AFTER the lift, not part of the grab.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            // Only spend the one-shot if the drag is still live — a fast drop
+            // shouldn't burn the hint before it ever showed.
+            guard session.draggedNoteID == note.id, !session.isSettling else { return }
+            seenIndentHint = true
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { indentNudgeX = 18 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+                withAnimation(.spring(response: 0.26, dampingFraction: 0.5)) { indentNudgeX = 0 }
+            }
+        }
     }
 
     /// Shadow that matches the resting row once settled: the selected pill's
@@ -3151,11 +3182,6 @@ final class CrossTierDragSession {
     /// floating row ghost insets/narrows to match a member tab as it moves
     /// in/out of folders.
     var draggedRowDepth: Int = 0
-    /// Valid indent-depth range at the current drop gap. When `max > min` there's
-    /// a nesting CHOICE here, so the insertion bar shows depth-stop notches — the
-    /// discoverability cue for the horizontal-indent gesture. Equal ⇒ no notches.
-    var dropDepthMin: Int = 0
-    var dropDepthMax: Int = 0
     var favoriteDropZoneVisible: Bool = false
     var showsAddToEssentialsBanner: Bool = false
 
@@ -3387,10 +3413,6 @@ final class CrossTierDragSession {
         let effective = target == sourceTier ? max(1, baseCount) : (baseCount + 1)
 
         var resolvedDepth = 0
-        // Valid indent range at the resolved gap (set by the indent branch); 0…0
-        // everywhere else ⇒ no depth-stop notches.
-        var depthMin = 0
-        var depthMax = 0
         let newIndex: Int
         if target == .favorite, frame.width > 0, !favoriteEntryLayout.isEmpty {
             // Span-aware flow hit-test: lay out the resting entries (singles =
@@ -3460,8 +3482,6 @@ final class CrossTierDragSession {
                 let d = max(minD, min(maxD, baseDepth + steps))
                 newIndex = g
                 resolvedDepth = d
-                depthMin = minD
-                depthMax = maxD
             } else {
                 let yInTier = max(0, y - frame.minY)
                 let raw = Int((yInTier / rowHeight).rounded(.down))
@@ -3470,8 +3490,7 @@ final class CrossTierDragSession {
         }
 
         let depthChanged = draggedRowDepth != resolvedDepth
-        let rangeChanged = dropDepthMin != depthMin || dropDepthMax != depthMax
-        if currentTier != target || currentIndex != newIndex || depthChanged || rangeChanged {
+        if currentTier != target || currentIndex != newIndex || depthChanged {
             let tierChanged = currentTier != target
             currentTier = target
             currentIndex = newIndex
@@ -3479,8 +3498,6 @@ final class CrossTierDragSession {
             // The PARENT folder (membership) is computed view-side from
             // `currentIndex` + this depth.
             draggedRowDepth = resolvedDepth
-            dropDepthMin = depthMin
-            dropDepthMax = depthMax
             // Trackpad detent when the drop target moves (discrete — fires once
             // per row/folder/depth crossing, not per frame). Heavier across tiers.
             playDragDetent(tierChanged: tierChanged)
@@ -3530,8 +3547,6 @@ final class CrossTierDragSession {
         frozenAsTile = nil
         draggedTileWidth = nil
         draggedRowDepth = 0
-        dropDepthMin = 0
-        dropDepthMax = 0
         draggedFolderID = nil
         nestTargetFolderID = nil
         dropIndicatorCenter = nil
@@ -4097,37 +4112,20 @@ private struct MacSidebarGroup: View {
 
     /// A thin insertion bar at `depth`'s indent — the visible placeholder for
     /// the dragged row while reordering (shows where + how deep it'll land).
-    /// When the current gap offers a nesting CHOICE (the valid depth range spans
-    /// more than one level), faint depth-stop notches mark each reachable indent
-    /// — the discoverability cue for the horizontal-indent gesture. The notches
-    /// straddle the bar, so a member shows one to the LEFT (drag out to un-nest)
-    /// and a note beside a folder shows one to the RIGHT (drag in to nest).
     private func dropIndicatorRow(depth: Int) -> some View {
-        ZStack(alignment: .leading) {
-            if session.dropDepthMax > session.dropDepthMin {
-                ForEach(session.dropDepthMin...session.dropDepthMax, id: \.self) { d in
-                    Capsule()
-                        .fill(spaceColor.opacity(0.4))
-                        .frame(width: 2, height: 14)
-                        // The active stop is already marked by the bar's left end.
-                        .opacity(d == depth ? 0 : 1)
-                        .padding(.leading, CGFloat(d) * Self.folderIndentStep + 10)
-                }
-            }
-            HStack(spacing: 0) {
-                Capsule()
-                    .fill(spaceColor)
-                    .frame(height: 3)
-            }
-            .padding(.leading, CGFloat(depth) * Self.folderIndentStep + 10)
-            .padding(.trailing, 10)
-            .onGeometryChange(for: CGRect.self) { proxy in
-                proxy.frame(in: .named("notes-column"))
-            } action: { f in
-                session.dropIndicatorCenter = CGPoint(x: f.midX, y: f.midY)
-            }
+        HStack(spacing: 0) {
+            Capsule()
+                .fill(spaceColor)
+                .frame(height: 3)
         }
         .frame(height: CrossTierDragSession.noteRowContentHeight)
+        .padding(.leading, CGFloat(depth) * Self.folderIndentStep + 10)
+        .padding(.trailing, 10)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named("notes-column"))
+        } action: { f in
+            session.dropIndicatorCenter = CGPoint(x: f.midX, y: f.midY)
+        }
     }
 
     @ViewBuilder
