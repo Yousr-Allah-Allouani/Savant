@@ -1,19 +1,5 @@
-import CoreTransferable
 import Foundation
 import SwiftData
-
-struct DraggedItemTransfer: Codable, Transferable {
-    enum Kind: String, Codable { case note, folder }
-    let kind: Kind
-    let id: UUID
-
-    static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .data)
-    }
-
-    static func note(_ id: UUID) -> DraggedItemTransfer { .init(kind: .note, id: id) }
-    static func folder(_ id: UUID) -> DraggedItemTransfer { .init(kind: .folder, id: id) }
-}
 
 enum NoteTier: String, Codable, CaseIterable, Identifiable {
     case favorite

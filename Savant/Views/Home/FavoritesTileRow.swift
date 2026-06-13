@@ -1,124 +1,143 @@
 import SwiftData
 import SwiftUI
 
-/// Anchors — the global top tier. Editorial direction: a clean starred list on
-/// the open color, not glass tiles. (Kept the filename/type so call sites and
-/// the project file don't churn.)
+/// Essentials — the global top tier as a grid of soft-white cards on the space
+/// accent (Figma skeleton). Three columns; extra notes wrap to new rows.
+/// A FULL drag surface: cards lift out to demote, reshuffle live inside the
+/// grid (manual order via `manualSortIndex`), and arrivals from the lists
+/// open a real cell slot the ghost morphs into.
+/// (Filename/type kept so call sites and the project file don't churn.)
 struct FavoritesTileRow: View {
-    @Environment(InteractionMode.self) private var interaction
     @Environment(\.modelContext) private var modelContext
+    @Environment(TouchDragSession.self) private var session
+    @Environment(\.isActiveSpacePage) private var isActivePage
 
+    /// This space's Essentials (favorites are global — space-agnostic),
+    /// already in manual order.
     let notes: [Note]
+    /// Full query results — promote commits look arrivals up here.
     let allNotes: [Note]
     let spaces: [Space]
     let currentSpace: Space
 
-    @State private var isTargeted = false
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
 
     var body: some View {
-        let dragActive = interaction.isDragging
-        let isEmpty = notes.isEmpty
+        let _ = publishContext()
+        let isTargeted = session.isCrossTier && session.currentTier == .favorite
 
-        if isEmpty && !dragActive {
-            EmptyView()
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                SectionLabel(title: "Anchors", count: notes.count,
-                             hint: dragActive ? "drop to anchor" : nil)
-
-                if isEmpty && dragActive {
-                    DropZonePlaceholder(tier: .favorite, isTargeted: isTargeted)
-                        .dropDestination(for: DraggedItemTransfer.self) { items, _ in
-                            handleDrop(items)
-                        } isTargeted: { isTargeted = $0 }
-                } else {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(notes) { note in
-                            AnchorRow(note: note, spaces: spaces, currentSpace: currentSpace)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .dropZoneAura(active: dragActive, targeted: isTargeted, cornerRadius: 14)
-                    .dropDestination(for: DraggedItemTransfer.self) { items, _ in
-                        handleDrop(items)
-                    } isTargeted: { isTargeted = $0 }
+        VStack(spacing: 0) {
+            if notes.isEmpty {
+                if session.isActive, session.payload?.isNote == true {
+                    TierDropBand(tier: .favorite)
                 }
+            } else {
+                LazyVGrid(columns: columns, spacing: 12) {
+                    ForEach(notes) { note in
+                        EssentialCard(note: note)
+                    }
+                }
+                .padding(4)
+                .overlay {
+                    if isTargeted {
+                        RoundedRectangle(cornerRadius: SavantTheme.cardRadius + 4, style: .continuous)
+                            .stroke(.primary.opacity(0.3), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
+                    }
+                }
+                .padding(-4)
+                .animation(.easeOut(duration: 0.15), value: isTargeted)
             }
-            .animation(.easeOut(duration: 0.18), value: dragActive)
+        }
+        // The grid grows a row when an arrival's slot wraps past the last
+        // card, and drops one once an outbound card's hole closes.
+        .padding(.bottom, bottomAdjustment)
+        .animation(session.isActive ? TouchDragSession.rowShuffle : nil, value: bottomAdjustment)
+        .onGeometryChange(for: ActiveFrame.self) { proxy in
+            ActiveFrame(frame: proxy.frame(in: .named("spaceContent")), active: isActivePage)
+        } action: { report in
+            if report.active { session.tierFrames[.favorite] = report.frame }
         }
     }
 
-    private func handleDrop(_ items: [DraggedItemTransfer]) -> Bool {
-        guard let first = items.first, first.kind == .note else { return false }
-        guard let note = allNotes.first(where: { $0.id == first.id }) else { return false }
-        let service = NoteService(context: modelContext)
-        do {
-            try service.promote(note, to: .favorite, currentSpace: currentSpace)
-            return true
-        } catch {
-            assertionFailure("Anchor drop failed: \(error)")
-            return false
+    private var bottomAdjustment: CGFloat {
+        session.bottomAdjustment(for: .favorite)
+    }
+
+    private func publishContext() {
+        guard isActivePage else { return }
+        session.publishTier(.init(
+            tier: .favorite,
+            blocks: notes.map(\.id),
+            spacing: 12,
+            gridColumns: 3,
+            acceptsFolders: false,
+            commitReorder: { ordered in
+                applyOrder(ordered)
+            },
+            commitInsert: { payload, index in
+                guard case .note(let id) = payload,
+                      let note = allNotes.first(where: { $0.id == id })
+                else { return }
+                do {
+                    try NoteService(context: modelContext).promote(
+                        note, to: .favorite, currentSpace: currentSpace
+                    )
+                } catch {
+                    assertionFailure("Promote to Essentials failed: \(error)")
+                    return
+                }
+                var ordered = notes.map(\.id).filter { $0 != id }
+                ordered.insert(id, at: min(max(0, index), ordered.count))
+                applyOrder(ordered)
+            }
+        ))
+    }
+
+    private func applyOrder(_ ordered: [UUID]) {
+        for (index, id) in ordered.enumerated() {
+            allNotes.first(where: { $0.id == id })?.manualSortIndex = index
         }
+        try? modelContext.save()
     }
 }
 
-/// A single Anchor as an editorial list row: a small star mark + the title on
-/// the open color. Mirrors the Kept/Stream row rhythm so the whole page reads
-/// as one typographic list, distinguished only by the star.
-private struct AnchorRow: View {
+/// One Essential: a tall soft-white card with the note title pinned to the
+/// top-leading corner. Quiet by design — the card shape carries the tier.
+private struct EssentialCard: View {
     @Environment(AppState.self) private var appState
-    @Environment(InteractionMode.self) private var interaction
-    @Environment(\.modelContext) private var modelContext
 
     let note: Note
-    let spaces: [Space]
-    let currentSpace: Space
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 11) {
-            Image(systemName: "star.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(.savantSubtleInk)
+        EssentialCardFace(note: note)
+            .aspectRatio(0.78, contentMode: .fit)
+            .contentShape(.rect(cornerRadius: SavantTheme.cardRadius))
+            .onTapGesture(count: 2) { appState.presentEdit(note) }
+            .onTapGesture { appState.presentRead(note) }
+            .dragRow(
+                id: note.id,
+                payload: .note(note.id),
+                tier: .favorite,
+                ghost: { .note(note) }
+            )
+    }
+}
+
+/// The bare card — shared between the in-grid card and the drag ghost.
+struct EssentialCardFace: View {
+    let note: Note
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
             Text(note.title)
-                .font(.system(.body, design: .rounded).weight(.medium))
+                .font(.system(.subheadline, design: .rounded).weight(.medium))
                 .foregroundStyle(.savantInk)
-                .lineLimit(1)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 8)
-        .contentShape(.rect)
-        .onTapGesture(count: 2) { appState.presentEdit(note) }
-        .onTapGesture { appState.presentRead(note) }
-        .draggable(DraggedItemTransfer.note(note.id)) {
-            NoteDragPreview(note: note)
-                .dragLifecycleHook(interaction)
-        }
-        .contextMenu {
-            Button("Edit", systemImage: "pencil") { appState.presentEdit(note) }
-            Button("Remove from Anchors", systemImage: "star.slash") {
-                update { try $0.promote(note, to: .pinned, currentSpace: currentSpace) }
-            }
-            Menu("Move to space", systemImage: "arrow.left.arrow.right") {
-                ForEach(spaces) { space in
-                    Button("\(space.emoji) \(space.name)") {
-                        update { try $0.move(note, to: space) }
-                    }
-                }
-            }
-            Button("Archive", systemImage: "archivebox") {
-                update { try $0.archive(note) }
-            }
-            Button("Delete", systemImage: "trash", role: .destructive) {
-                update { try $0.delete(note) }
-            }
-        }
-    }
-
-    private func update(_ work: (NoteService) throws -> Void) {
-        do {
-            try work(NoteService(context: modelContext))
-        } catch {
-            assertionFailure("Anchor action failed: \(error)")
-        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .savantCard(radius: SavantTheme.cardRadius)
     }
 }

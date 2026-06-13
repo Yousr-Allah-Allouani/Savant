@@ -96,7 +96,10 @@ struct MacNotesSidebar: View {
     let folders: [Folder]
     @Binding var selectedSpaceID: UUID?
     @Binding var selectedNoteIDsBySpace: [UUID: UUID]
-    let spacePageOffset: CGFloat // fractional page index, animated by the parent
+    /// Fractional page index, animated by the parent. Read ONLY inside
+    /// `SpacePagerOffsetModifier`'s body so per-frame swipe updates move the
+    /// already-built column track without re-evaluating this view's body.
+    let pager: SpacePagerModel
     /// While creation mode is up, the form's gradient drives the
     /// window+sidebar background. MacRootView owns the storage so the
     /// entire window updates in real time.
@@ -136,7 +139,6 @@ struct MacNotesSidebar: View {
     var cancelPendingSplit: () -> Void = { }
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.displayScale) private var displayScale
     @Environment(\.modelContext) private var modelContext
     @State private var searchText: String = ""
     // Hoisted to MacRootView so the editor pane can observe the in-progress
@@ -329,9 +331,13 @@ struct MacNotesSidebar: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Computed ONCE per body pass — `favoriteNotes` filters + sorts the
+        // whole notes array, and the old code evaluated it in five places
+        // (animation key, Essentials row, ghost overlay, onChange) per pass.
+        let favorites = favoriteNotes
+        return VStack(spacing: 0) {
             ZStack(alignment: .top) {
-                normalSidebarContent
+                normalSidebarContent(favorites: favorites)
                     .opacity(isCreatingSpace ? 0 : 1)
                     .allowsHitTesting(!isCreatingSpace)
                     .animation(.easeInOut(duration: 0.18), value: isCreatingSpace)
@@ -384,8 +390,8 @@ struct MacNotesSidebar: View {
         .animation(.smooth(duration: 0.22),
                    value: EssentialsLayoutKey(
                        showsBanner: shouldShowAddToEssentialsBanner,
-                       hasEssentials: !favoriteNotes.isEmpty,
-                       count: favoriteNotes.count
+                       hasEssentials: !favorites.isEmpty,
+                       count: favorites.count
                    ))
         .frame(width: width)
         // Intentionally NO tinted background here. MacSpaceBackground +
@@ -408,7 +414,7 @@ struct MacNotesSidebar: View {
                     activeSpace: selectedSpace,
                     session: session,
                     width: width,
-                    sourceAlreadyInFavorites: favoriteNotes.contains { $0.id == id },
+                    sourceAlreadyInFavorites: favorites.contains { $0.id == id },
                     isSelected: displayedSelectedNoteID(for: selectedSpace) == id,
                     draggedNotes: session.draggedNoteIDs.compactMap { did in notes.first { $0.id == did } },
                     splitPair: {
@@ -440,7 +446,7 @@ struct MacNotesSidebar: View {
         .onChange(of: activeOpenNoteID) { _, newValue in
             selection.openNoteID = newValue
         }
-        .onChange(of: favoriteNotes.count) { _, _ in
+        .onChange(of: favorites.count) { _, _ in
             syncEssentialsDropZoneVisibility()
         }
         .onChange(of: shouldShowAddToEssentialsBanner) { _, _ in
@@ -450,9 +456,11 @@ struct MacNotesSidebar: View {
             searchText = ""
         }
         // Drives edge auto-switch + drop-on-chip: translation updates every
-        // drag frame, so we re-evaluate the cursor's drag targets here.
-        .onChange(of: session.translation) { _, _ in
-            handleDragOverTargets()
+        // drag frame. Observed via a zero-size leaf view — an `.onChange`
+        // here would read `translation` during THIS body's evaluation and
+        // re-run the whole sidebar (every space column, every row) per frame.
+        .background {
+            DragFrameWatcher(session: session) { handleDragOverTargets() }
         }
         .confirmationDialog(
             "Delete \(pendingBatchDelete.count) notes?",
@@ -475,7 +483,7 @@ struct MacNotesSidebar: View {
     }
 
     @ViewBuilder
-    private var normalSidebarContent: some View {
+    private func normalSidebarContent(favorites: [Note]) -> some View {
         VStack(spacing: 0) {
             MacSidebarCommandField(
                 searchText: $searchText,
@@ -488,9 +496,9 @@ struct MacNotesSidebar: View {
 
             // Anchored Essentials grid — rendered once at sidebar level so
             // it doesn't move during a per-space swipe. Cross-space.
-            if !favoriteNotes.isEmpty, let activeSpace = selectedSpace {
+            if !favorites.isEmpty, let activeSpace = selectedSpace {
                 MacEssentialsRow(
-                    notes: favoriteNotes,
+                    notes: favorites,
                     space: activeSpace,
                     allNotes: notes,
                     selectedNoteID: displayedSelectedNoteID(for: selectedSpace),
@@ -573,27 +581,16 @@ struct MacNotesSidebar: View {
                     .frame(width: width)
                 }
             }
-            .offset(x: pixelAlignedColumnOffset)
-            .frame(width: width, alignment: .leading)
-            .frame(maxHeight: .infinity)
-            .clipShape(MacSpacePageClipShape(trailingBleed: spacePageClipTrailingBleed))
+            // The fractional pager offset is applied by a modifier whose body
+            // is the ONLY place `pager.pageOffset` is read — per swipe frame
+            // just the modifier re-evaluates and translates the already-built
+            // track; the columns themselves are never re-diffed.
+            .modifier(SpacePagerOffsetModifier(
+                pager: pager,
+                pageWidth: width,
+                trailingBleed: pageClipTrailingBleed
+            ))
         }
-    }
-
-    private var pixelAlignedColumnOffset: CGFloat {
-        let rawOffset = -spacePageOffset * width
-        guard displayScale > 0 else { return rawOffset }
-        return (rawOffset * displayScale).rounded() / displayScale
-    }
-
-    private var spacePageClipTrailingBleed: CGFloat {
-        isSpaceSwipeVisuallyActive ? pageClipTrailingBleed : 0
-    }
-
-    private var isSpaceSwipeVisuallyActive: Bool {
-        let distanceFromSettledPage = abs(spacePageOffset - spacePageOffset.rounded()) * width
-        let pixelThreshold = displayScale > 0 ? 0.5 / displayScale : 0.25
-        return distanceFromSettledPage > pixelThreshold
     }
 
     @ViewBuilder
@@ -715,6 +712,41 @@ struct MacNotesSidebar: View {
         let next = idx + dir
         guard next >= 0, next < spaces.count else { return }
         withAnimation(.smooth(duration: 0.22)) { selectedSpaceID = spaces[next].id }
+    }
+}
+
+/// Applies the horizontal space-pager translation + edge clip to the column
+/// track. Reading `pager.pageOffset` inside THIS body confines per-frame
+/// swipe invalidation to the modifier — `content` (the full HStack of space
+/// columns) is an opaque token that just gets re-positioned.
+private struct SpacePagerOffsetModifier: ViewModifier {
+    let pager: SpacePagerModel
+    let pageWidth: CGFloat
+    let trailingBleed: CGFloat
+    @Environment(\.displayScale) private var displayScale
+
+    func body(content: Content) -> some View {
+        content
+            .offset(x: pixelAlignedColumnOffset)
+            .frame(width: pageWidth, alignment: .leading)
+            .frame(maxHeight: .infinity)
+            .clipShape(MacSpacePageClipShape(trailingBleed: activeTrailingBleed))
+    }
+
+    private var pixelAlignedColumnOffset: CGFloat {
+        let rawOffset = -pager.pageOffset * pageWidth
+        guard displayScale > 0 else { return rawOffset }
+        return (rawOffset * displayScale).rounded() / displayScale
+    }
+
+    private var activeTrailingBleed: CGFloat {
+        isSpaceSwipeVisuallyActive ? trailingBleed : 0
+    }
+
+    private var isSpaceSwipeVisuallyActive: Bool {
+        let distanceFromSettledPage = abs(pager.pageOffset - pager.pageOffset.rounded()) * pageWidth
+        let pixelThreshold = displayScale > 0 ? 0.5 / displayScale : 0.25
+        return distanceFromSettledPage > pixelThreshold
     }
 }
 
@@ -1327,6 +1359,9 @@ private struct MacSpaceStrip: View {
     @State private var dragTranslation: CGFloat = 0
     @State private var chipCenterX: [UUID: CGFloat] = [:]
     @State private var baseCenters: [CGFloat] = []
+    /// True during the post-release glide into the landing slot — blocks a
+    /// new chip drag from mutating the settling chip's state mid-flight.
+    @State private var isChipSettling = false
 
     private var layoutMode: SpaceStripMode {
         let total = spaces.count + (isCreatingSpace ? 1 : 0)
@@ -1357,7 +1392,7 @@ private struct MacSpaceStrip: View {
     private func reorderGesture(space: Space, index: Int) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .named("space-strip"))
             .onChanged { value in
-                guard !isCreatingSpace, spaces.count > 1 else { return }
+                guard !isCreatingSpace, spaces.count > 1, !isChipSettling else { return }
                 if draggingID == nil {
                     draggingID = space.id
                     dragSourceIndex = index
@@ -1380,6 +1415,28 @@ private struct MacSpaceStrip: View {
     }
 
     private func commitReorder() {
+        guard draggingID != nil else { return }
+        // Glide the chip from the release point into its landing slot (the
+        // base center of the target index) BEFORE committing — releasing
+        // mid-strip used to teleport the chip to the slot in one frame.
+        guard baseCenters.indices.contains(dragSourceIndex),
+              baseCenters.indices.contains(dragCurrentIndex) else {
+            finalizeReorder()
+            return
+        }
+        let settleTranslation = baseCenters[dragCurrentIndex] - baseCenters[dragSourceIndex]
+        isChipSettling = true
+        withAnimation(.smooth(duration: 0.18)) {
+            dragTranslation = settleTranslation
+        } completion: {
+            finalizeReorder()
+        }
+    }
+
+    /// Commit the new order and clear the drag state in one non-animated
+    /// transaction — the chip is already sitting on its slot, so the swap to
+    /// the re-ordered resting row must not move anything.
+    private func finalizeReorder() {
         if draggingID != nil, spaces.indices.contains(dragSourceIndex) {
             var ids = spaces.map(\.id)
             let moved = ids.remove(at: dragSourceIndex)
@@ -1389,9 +1446,14 @@ private struct MacSpaceStrip: View {
             }
             try? modelContext.save()
         }
-        draggingID = nil
-        dragTranslation = 0
-        baseCenters = []
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            draggingID = nil
+            dragTranslation = 0
+            baseCenters = []
+            isChipSettling = false
+        }
     }
 
     var body: some View {
@@ -1842,7 +1904,7 @@ private struct MacSpaceNotesColumn: View {
             // without the gate it re-fires when the session clears on release
             // and animates the whole column's reflow — the residual movement
             // of the other rows after a drop. Nil while inactive → instant.
-                .animation(session.isActive ? .smooth(duration: 0.16) : nil,
+                .animation(session.isActive ? CrossTierDragSession.rowShuffle : nil,
                        value: columnLayoutKey)
         }
         // Only bounce when content actually overflows. Without this,
@@ -2521,7 +2583,11 @@ private struct MacEssentialsRow: View {
             }
         }
         // Reflow the gap/tiles as the drop slot or resting set changes.
-        .animation(.smooth(duration: 0.18),
+        // Gated on `isActive` like the row tiers: `.animation(value:)` is
+        // transaction-independent, so without the gate it re-fires on the
+        // post-release session reset / @Query catch-up and animates the
+        // settled grid — residual movement after the drop. Nil → instant.
+        .animation(session.isActive ? .smooth(duration: 0.18) : nil,
                    value: "\(session.currentIndex)|\(restingEntriesExDragged.count)")
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -2996,7 +3062,7 @@ private struct MacEssentialsRow: View {
                     width: cell.x - session.sourceRowCenter.x,
                     height: cell.y - session.sourceRowCenter.y
                 )
-                withAnimation(.smooth(duration: 0.2)) {
+                withAnimation(CrossTierDragSession.commitGlide) {
                     session.isSettling = true
                     session.translation = target
                 } completion: {
@@ -3761,10 +3827,16 @@ private struct MacSidebarGroup: View {
     private var isCurrentTier: Bool { session.currentTier == tier }
 
     var body: some View {
-        let rows = displayedFlatRows
+        // `flatRows` walks SwiftData relationships and sorts — compute it ONCE
+        // per body pass and thread it through. The old code recomputed it in
+        // `displayedFlatRows`, in `offset(forIndex:)` / `multiOffset` for
+        // EVERY row, and in the onChange keys: O(rows²) with repeated
+        // relationship faults on each drag tick.
+        let resting = flatRows
+        let rows = displayedRows(resting: resting)
         return LazyVStack(spacing: 3) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-                flatRowView(row, at: index)
+                flatRowView(row, at: index, resting: resting)
             }
             // Gate on `isActive`: during a drag this animates the live
             // reshuffle, but `.animation(value:)` is transaction-independent
@@ -3800,11 +3872,11 @@ private struct MacSidebarGroup: View {
                 }
             }
         }
-        .onChange(of: flatRows.count) { _, newValue in
+        .onChange(of: resting.count) { _, newValue in
             if isActiveSpace { session.noteCountsByTier[tier] = newValue }
         }
         .onAppear { publishTierRows() }
-        .onChange(of: tierRowsKey) { _, _ in publishTierRows() }
+        .onChange(of: tierRowsKey(for: resting)) { _, _ in publishTierRows() }
         .onChange(of: isActiveSpace) { _, newValue in
             // When this column becomes the active one (after a swipe, edge
             // auto-switch, or the first time `selectedSpaceID` resolves),
@@ -3893,10 +3965,10 @@ private struct MacSidebarGroup: View {
                     depth: $0.depth) }
     }
 
-    private var tierRowsKey: String {
+    private func tierRowsKey(for resting: [SidebarRow]) -> String {
         var dragged = session.draggedNoteIDs.map(\.uuidString)
         if let fid = session.draggedFolderID { dragged.append(fid.uuidString) }
-        let rows = flatRows.map { ($0.isFolder ? "F" : "n") + $0.rowID.uuidString.prefix(4) }.joined()
+        let rows = resting.map { ($0.isFolder ? "F" : "n") + $0.rowID.uuidString.prefix(4) }.joined()
         return dragged.joined() + "|" + rows
     }
 
@@ -4037,7 +4109,13 @@ private struct MacSidebarGroup: View {
     /// row(s) are lifted and re-inserted at the resolved slot so the render ==
     /// the eventual commit. For cross-tier folder drags the dragged folder isn't
     /// in this tier's rows; insert the drop indicator only.
+    /// Convenience for the one-shot commit paths; the per-frame render path
+    /// goes through `displayedRows(resting:)` with the body's cached rows.
     private var displayedFlatRows: [SidebarRow] {
+        displayedRows(resting: flatRows)
+    }
+
+    private func displayedRows(resting flatRows: [SidebarRow]) -> [SidebarRow] {
         guard usesReorderRender else { return flatRows }
         let ids = Set(draggedRowIDs)
         guard !ids.isEmpty else { return flatRows }
@@ -4095,7 +4173,7 @@ private struct MacSidebarGroup: View {
     }
 
     @ViewBuilder
-    private func flatRowView(_ row: SidebarRow, at index: Int) -> some View {
+    private func flatRowView(_ row: SidebarRow, at index: Int, resting: [SidebarRow]) -> some View {
         if row.isCrossTierPlaceholder {
             // Cross-tier folder drag: drop indicator bar in the destination tier.
             dropIndicatorRow(depth: row.depth).frame(height: nil)
@@ -4118,7 +4196,7 @@ private struct MacSidebarGroup: View {
                     renamingFolderID: $renamingFolderID, depth: row.depth
                 )
                 .opacity(isDraggedFolder ? 0 : 1)
-                .offset(y: usesReorderRender ? 0 : offset(forIndex: index))
+                .offset(y: usesReorderRender ? 0 : offset(forIndex: index, resting: resting))
                 .simultaneousGesture(folderDragGesture(for: folder, at: index))
             }
         case .note(let note):
@@ -4151,7 +4229,7 @@ private struct MacSidebarGroup: View {
                     .padding(.leading, CGFloat(row.depth) * Self.folderIndentStep)
                     .opacity(isSource ? 0 : 1)
                     .frame(height: collapse ? 0 : nil)
-                    .offset(y: usesReorderRender ? 0 : offset(forIndex: index))
+                    .offset(y: usesReorderRender ? 0 : offset(forIndex: index, resting: resting))
                     .simultaneousGesture(liveDragGesture(for: note, at: index))
             }
         case .empty:
@@ -4259,8 +4337,7 @@ private struct MacSidebarGroup: View {
     /// the whole group's height so the N-row gap opens. Visible index is the
     /// count of non-dragged rows before `i` (collapsed rows take no space, so
     /// the cursor-derived `currentIndex` is already in visible terms).
-    private func multiOffset(forIndex i: Int) -> CGFloat {
-        let rows = flatRows
+    private func multiOffset(forIndex i: Int, resting rows: [SidebarRow]) -> CGFloat {
         guard i < rows.count else { return 0 }
         if session.isDragged(rows[i].rowID) { return 0 }
         guard isCurrentTier else { return 0 }
@@ -4274,9 +4351,9 @@ private struct MacSidebarGroup: View {
             : 0
     }
 
-    private func offset(forIndex i: Int) -> CGFloat {
+    private func offset(forIndex i: Int, resting: [SidebarRow]) -> CGFloat {
         guard session.isActive else { return 0 }
-        if session.isMulti { return multiOffset(forIndex: i) }
+        if session.isMulti { return multiOffset(forIndex: i, resting: resting) }
 
         // Post-commit short-circuit: the dragged note is now at its target
         // slot in this tier's flat list (true for within-tier reorder once
@@ -4284,7 +4361,7 @@ private struct MacSidebarGroup: View {
         // tier change lands). Return 0 for every row so nothing visibly
         // shifts before `session.reset()`.
         if let id = session.draggedNoteID,
-           let idx = flatRows.firstIndex(where: { $0.rowID == id }),
+           let idx = resting.firstIndex(where: { $0.rowID == id }),
            idx == session.currentIndex {
             return 0
         }
@@ -4299,7 +4376,7 @@ private struct MacSidebarGroup: View {
                 // at release. Pre-shift those rows by -3 during the drag
                 // so they're already at their post-commit positions.
                 if let id = session.draggedNoteID,
-                   flatRows.contains(where: { $0.rowID == id }),
+                   resting.contains(where: { $0.rowID == id }),
                    i > session.sourceIndex {
                     return -3
                 }
@@ -5253,6 +5330,9 @@ private struct MacFolderRow: View {
             RoundedRectangle(cornerRadius: 7, style: .continuous).fill(headerFillColor)
         }
         .animation(CrossTierDragSession.rowShuffle, value: isNestTarget)
+        // Same hover ease as MacNoteRow so folder + note rows light up with
+        // one shared cadence (the folder fill used to snap on instantly).
+        .animation(.easeOut(duration: 0.08), value: isHovering)
         .padding(.leading, CGFloat(depth) * indentStep)
         .onTapGesture { if !isRenaming { toggleExpanded() } }
         .onHover { isHovering = $0 }

@@ -4,12 +4,16 @@ import SwiftUI
 struct NoteRowView: View {
     @Environment(AppState.self) private var appState
     @Environment(InteractionMode.self) private var interaction
-    @Environment(\.modelContext) private var modelContext
 
     let note: Note
-    let spaces: [Space]
     let currentSpace: Space
+    /// `true` = kept row (primary white surface, title + 1-line preview);
+    /// `false` = stream row (quieter surface, title only).
     let showsPreview: Bool
+    /// Where this row lives — the drag engine resolves the tier's published
+    /// context from these at lift time.
+    let tier: NoteTier
+    var parentFolderID: UUID? = nil
 
     var body: some View {
         let editing = interaction.isEditing(spaceID: currentSpace.id)
@@ -23,8 +27,8 @@ struct NoteRowView: View {
                     .transition(.scale.combined(with: .opacity))
             }
 
-            rowContent
-                .contentShape(.rect)
+            NoteRowCard(note: note, showsPreview: showsPreview)
+                .contentShape(.rect(cornerRadius: SavantTheme.rowRadius))
                 .onTapGesture(count: 2) {
                     if !editing { appState.presentEdit(note) }
                 }
@@ -36,93 +40,61 @@ struct NoteRowView: View {
                     }
                 }
         }
-        .padding(.horizontal, editing ? 6 : 0)
-        .padding(.vertical, 1)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : .clear)
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: SavantTheme.rowRadius, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.7), lineWidth: 1.5)
+            }
+        }
+        .dragRow(
+            id: note.id,
+            payload: .note(note.id),
+            tier: tier,
+            parentFolderID: parentFolderID,
+            spaceID: currentSpace.id,
+            ghost: { .note(note) },
+            isEnabled: !editing
         )
-        .draggable(DraggedItemTransfer.note(note.id)) {
-            NoteDragPreview(note: note)
-                .dragLifecycleHook(interaction)
-        }
-        .contextMenu {
-            if !editing { noteActions }
-        }
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: editing)
         .animation(.easeOut(duration: 0.15), value: isSelected)
     }
+}
 
-    private var rowContent: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Circle()
-                .fill(.primary.opacity(0.72))
-                .frame(width: 6, height: 6)
-                .padding(.top, 9)
+/// The bare row card — shared between the in-list row and the drag ghost so
+/// the lifted ghost is pixel-identical to the row it replaces.
+struct NoteRowCard: View {
+    let note: Note
+    let showsPreview: Bool
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(note.title)
-                        .font(.system(.body, design: .rounded))
-                        .foregroundStyle(.savantInk)
-                        .lineLimit(1)
-                    if let moveSuggestionTitle = note.moveSuggestionTitle {
-                        Text("→ \(moveSuggestionTitle)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(.primary.opacity(0.08), in: .capsule)
-                    }
-                }
-
-                if showsPreview {
-                    Text(note.bodyMarkdown)
-                        .font(.callout)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(note.title)
+                    .font(.system(size: 17, design: .rounded))
+                    .foregroundStyle(.savantInk)
+                    .lineLimit(1)
+                if let moveSuggestionTitle = note.moveSuggestionTitle {
+                    Text("→ \(moveSuggestionTitle)")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(.primary.opacity(0.08), in: .capsule)
                 }
+                Spacer(minLength: 0)
             }
 
-            Spacer(minLength: 0)
+            if showsPreview, !note.bodyMarkdown.isEmpty {
+                Text(note.bodyMarkdown)
+                    .font(.system(size: 14, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
-        .padding(.vertical, 7)
+        .padding(.horizontal, 18)
+        .padding(.vertical, showsPreview ? 13 : 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    @ViewBuilder private var noteActions: some View {
-        Button("Edit", systemImage: "pencil") {
-            appState.presentEdit(note)
-        }
-        Button("Keep", systemImage: "pin.fill") {
-            update { try $0.promote(note, to: .pinned, currentSpace: currentSpace) }
-        }
-        Button("Anchor", systemImage: "star.fill") {
-            update { try $0.promote(note, to: .favorite, currentSpace: currentSpace) }
-        }
-        Menu("Move to space", systemImage: "arrow.left.arrow.right") {
-            ForEach(spaces) { space in
-                Button("\(space.emoji) \(space.name)") {
-                    update { try $0.move(note, to: space) }
-                }
-            }
-        }
-        Button("Duplicate", systemImage: "doc.on.doc") {
-            update { _ = try $0.duplicate(note) }
-        }
-        Button("Archive", systemImage: "archivebox") {
-            update { try $0.archive(note) }
-        }
-        Button("Delete", systemImage: "trash", role: .destructive) {
-            update { try $0.delete(note) }
-        }
-    }
-
-    private func update(_ work: (NoteService) throws -> Void) {
-        do {
-            try work(NoteService(context: modelContext))
-        } catch {
-            assertionFailure("Note action failed: \(error)")
-        }
+        .frame(minHeight: showsPreview ? 62 : 48)
+        .savantCard(radius: SavantTheme.rowRadius, soft: !showsPreview)
     }
 }

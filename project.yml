@@ -49,6 +49,10 @@ targets:
         DEVELOPMENT_TEAM: X26JY6WC4V
         DEVELOPMENT_ASSET_PATHS: ""
         TARGETED_DEVICE_FAMILY: "1"
+    scheme:
+      testTargets:
+        - SavantTests
+        - SavantUITests
     info:
       path: Savant/Resources/Info.plist
       properties:
@@ -82,7 +86,11 @@ targets:
       - path: Savant/Services/FolderService.swift
       - path: Savant/Extensions/Color+Scheme.swift
       - path: Savant/Extensions/View+HoverTracking.swift
+      - path: Savant/Views/Shared/SavantTheme.swift
+      - path: Savant/Views/Shared/GrainOverlay.swift
       - path: Savant/Views/Mac
+    scheme:
+      testTargets: []
     resources:
       - path: Savant/Resources/Assets.xcassets
     entitlements:

@@ -6,16 +6,10 @@ import Observation
 final class InteractionMode {
     enum Mode: Equatable {
         case idle
-        case dragging
         case editing(spaceID: UUID, selection: Set<UUID>)
     }
 
     var mode: Mode = .idle
-
-    var isDragging: Bool {
-        if case .dragging = mode { return true }
-        return false
-    }
 
     var isEditing: Bool {
         if case .editing = mode { return true }
@@ -30,14 +24,6 @@ final class InteractionMode {
     func isEditing(spaceID: UUID) -> Bool {
         if case .editing(let id, _) = mode { return id == spaceID }
         return false
-    }
-
-    func beginDragging() {
-        if !isEditing { mode = .dragging }
-    }
-
-    func endDragging() {
-        if case .dragging = mode { mode = .idle }
     }
 
     func enterEditMode(spaceID: UUID) {

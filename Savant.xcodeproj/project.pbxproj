@@ -9,12 +9,10 @@
 /* Begin PBXBuildFile section */
 		006B647472F41EFB03A6E339 /* ZenGradientPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81B1BF33203E7A384A732526 /* ZenGradientPicker.swift */; };
 		014D4DF0E64B4D2303FA20FE /* SavantUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E908B5D51A276D30DE021751 /* SavantUITests.swift */; };
-		08E84B29C32238707E66BEDE /* DragPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A65B28ED5260A625E98C61F /* DragPreview.swift */; };
 		0937AE429233FF1932BFA0FD /* ZenGradientRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBE67D86646FA000A8B136C0 /* ZenGradientRenderer.swift */; };
 		0C402294C7A3BD998FA4428C /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A6EC02B34A8F54989A60766 /* AppState.swift */; };
 		0D0B6E8068C20CD332280A2A /* NoteRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 143D9136DB0B10D4BEDE21FC /* NoteRowView.swift */; };
 		0E0B35703DFD5AB9620DEB5E /* View+Keyboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 602F31A12558BAD14FD13772 /* View+Keyboard.swift */; };
-		0E469D491F6A8E14EA8CF134 /* PinnedSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0867907D732AE24CDB7F06F7 /* PinnedSection.swift */; };
 		10B1273E5210058308B545FC /* Color+Scheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EF16EBD72D8F9F44E8F5F49 /* Color+Scheme.swift */; };
 		12654BDAB6AD3068A517AE68 /* GlassViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41E376E47A71AB623E7E0BBB /* GlassViews.swift */; };
 		142DA0702B2E40F327142E6E /* NoteEditPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44604743135560F4679CC526 /* NoteEditPage.swift */; };
@@ -22,9 +20,12 @@
 		203DB5DCFEA0EC35498AD68C /* OnboardingFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD3FBE920CA55A9ACFEEE481 /* OnboardingFlow.swift */; };
 		20D680E4B97EBE26ED1296C5 /* NewSpaceFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2628B9A082BCF2015D3A4508 /* NewSpaceFlowView.swift */; };
 		223A628E1F6BE6B8F33AE875 /* View+HoverTracking.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6D4BBACD44434F19B6517E2 /* View+HoverTracking.swift */; };
+		23C8E0550134B8944937D99D /* TierRowsBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B294C1805D7AFE1CC1B32DD7 /* TierRowsBuilder.swift */; };
 		2D06284F8C57ACD97298AC2C /* FolderRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F2A5252759CDE2E80E97010 /* FolderRowView.swift */; };
+		322FF7F6B5814185DF5CA1CA /* SavantTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF42DEFDA45304B5965A507 /* SavantTheme.swift */; };
 		3253544AD41D182CA70DA49D /* BackgroundTaskScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC5D64FBA1B18B4684ECF141 /* BackgroundTaskScheduler.swift */; };
 		3E596556CCC32C8FDA732E41 /* MacIconPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8AB5D188E78CBF43E397B87 /* MacIconPicker.swift */; };
+		3F7E01E82CC8F3D1A996F219 /* TierRowList.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F26EC4E4379DC85661C8AD9 /* TierRowList.swift */; };
 		405AC4E78FE586CC99120B65 /* RichEditorSwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = 2A96B02F92C1D70BDD59E761 /* RichEditorSwiftUI */; };
 		40C9EF590E5CE240768BE055 /* InteractionMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC63B6C98D5B20EA5293DAE5 /* InteractionMode.swift */; };
 		433C1B63FC03435371E9A6BC /* MacCommandPalette.swift in Sources */ = {isa = PBXBuildFile; fileRef = F25978BBB739347D6E88B2A3 /* MacCommandPalette.swift */; };
@@ -32,36 +33,39 @@
 		475474902B0CAC014352CEA4 /* RichEditorSwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = 18B36040C782BC635AF9AD7F /* RichEditorSwiftUI */; };
 		49991B43732CF9993443F25B /* TidyReviewSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1A85859089622388313BC7 /* TidyReviewSheet.swift */; };
 		506916D3EDB3B9DC7EE98A51 /* MacRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5F3B07204C6F6C360684421 /* MacRootView.swift */; };
-		580FE2E1D5A00C5810AEFD6C /* DraggableItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BB1DEFAA27A0DCF619FEC32 /* DraggableItem.swift */; };
 		5BB0EB5CF43A9B96643B276F /* NoteReadSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEC17E73406085D68AC70FB7 /* NoteReadSheet.swift */; };
 		614C0D8E490F8D528518271D /* InteractionMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC63B6C98D5B20EA5293DAE5 /* InteractionMode.swift */; };
 		639D3697859247EE5451A96F /* InputBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD85C88F3EA295F45FDA0B74 /* InputBarView.swift */; };
 		6E2B9B358AA0FB3142824197 /* MacNotesSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35208B6FE5071CF7F1027ABD /* MacNotesSidebar.swift */; };
 		6EACA0B81DD4056E72D956F0 /* Color+Scheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EF16EBD72D8F9F44E8F5F49 /* Color+Scheme.swift */; };
 		6FA2220F204F604A9DB87FF8 /* ArchiveBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69362E0690FE857DB636C4E0 /* ArchiveBrowserView.swift */; };
+		711724606FED94DDC2D87C2E /* GrainOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B477DB6C666E1A71552EE1CC /* GrainOverlay.swift */; };
 		740C3609F5248B44A1CDD105 /* FoundationModelServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D6C2E909A31355FAFB262CB /* FoundationModelServices.swift */; };
 		758C01920B0DE21C264CD7BD /* SavantApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447C725E539B866DCAD1A0E8 /* SavantApp.swift */; };
 		785D88819CD66481952F966B /* SettingsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E8843E68FB964F30A74766 /* SettingsSheet.swift */; };
 		8041C150748E97D65675E1AB /* HSLCircularPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 132DE57710029C0A3B356D7A /* HSLCircularPickerView.swift */; };
 		8183BE8DD7EDF083D41D8F02 /* SpaceHeaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 489D34A2482E92B07A606D88 /* SpaceHeaderView.swift */; };
+		8231825A2C3F1BE1F847D245 /* DragLiftGesture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39DABF8E29B9D98A64A29C69 /* DragLiftGesture.swift */; };
 		83AC936F8A064927BA9C8C64 /* MacCreateSpaceForm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AFEA4FD9656C6B74956DD10 /* MacCreateSpaceForm.swift */; };
 		874BB2F9DC4FA5FABA74C6EA /* TidyBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDA3E541FA1E22277EC2F5D7 /* TidyBannerView.swift */; };
 		8A105730B5D5C390B98CB8C7 /* ZenColorWheel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 703A568EADEF671A2FEDCD2C /* ZenColorWheel.swift */; };
 		8B4F821BBFEBDA592C141C24 /* FavoritesTileRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59572A160BD9716D35FFA6E7 /* FavoritesTileRow.swift */; };
 		8BC7BF673D2E21FFD0566A68 /* FolderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 971235DEEEE78B209127BD68 /* FolderService.swift */; };
-		91B613F6A829B58214F38407 /* DropZones.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91478E1FDD3292152702A1F3 /* DropZones.swift */; };
+		97812395D684AC6A1F4143D5 /* SavantTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF42DEFDA45304B5965A507 /* SavantTheme.swift */; };
 		98A0640D5C864DA9A8453FB4 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A6EC02B34A8F54989A60766 /* AppState.swift */; };
 		9BA6C4F8BA88DEB1BB3DB2AC /* SavantModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAD77D3DB09E100D9B6A36A4 /* SavantModelTests.swift */; };
 		9E2A6FFBC81AC736E11D3AB4 /* SpaceGradient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93894CA1F741852EE27189B3 /* SpaceGradient.swift */; };
 		A48F01A55F416D5A2291E1C1 /* SearchSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C4C97B48016127AB40DEE50 /* SearchSheet.swift */; };
-		AB294EFA1BACE6E5D4E970F6 /* RandomSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 230C6FD7AA92E96607709BA6 /* RandomSection.swift */; };
 		ADF5A73E9B2636BC3E7B7C36 /* SpaceGradient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93894CA1F741852EE27189B3 /* SpaceGradient.swift */; };
+		AFD6FCD38F3CFFEDEDA88689 /* DragGhostOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39103A47AECDE707FEDBE522 /* DragGhostOverlay.swift */; };
 		B464E30463426587F36D4810 /* MacNoteWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85ED9BDC6E9F78D20A59A5D5 /* MacNoteWorkspace.swift */; };
 		BC3663ACC6AC1F68D14372F2 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = F353736C12155A33A552DA26 /* Models.swift */; };
 		C3CC496532354557EF8D1ECF /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56E077784985271F419EC997 /* PersistenceController.swift */; };
+		C4B2788A741399FBA4AC781E /* GrainOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B477DB6C666E1A71552EE1CC /* GrainOverlay.swift */; };
 		C5638E020995B8E7677CE94C /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = F353736C12155A33A552DA26 /* Models.swift */; };
 		C650D4645B57FA6E54C0F035 /* ExpandableGlassMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92C83E44F84187D819128D6E /* ExpandableGlassMenu.swift */; };
 		CCA35E6BCC8A5680762E3696 /* SpaceSwitcherSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E91E97CD6CDAE21428DF1CAD /* SpaceSwitcherSheet.swift */; };
+		D925F493D82F11D241DC17F8 /* TouchDragSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C1486FCC307C41C061CF13 /* TouchDragSession.swift */; };
 		DB35F7786E6B019BB616FE77 /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56E077784985271F419EC997 /* PersistenceController.swift */; };
 		E0AC6336164293682149981C /* MultiSelectActionBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC21ED8686A26A1826788D56 /* MultiSelectActionBar.swift */; };
 		E3B6DAA540F1126C1C0E9487 /* SavantApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447C725E539B866DCAD1A0E8 /* SavantApp.swift */; };
@@ -90,15 +94,16 @@
 
 /* Begin PBXFileReference section */
 		05138DBA113FF2282C3704A5 /* SavantTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SavantTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		0867907D732AE24CDB7F06F7 /* PinnedSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinnedSection.swift; sourceTree = "<group>"; };
+		0F26EC4E4379DC85661C8AD9 /* TierRowList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TierRowList.swift; sourceTree = "<group>"; };
 		132DE57710029C0A3B356D7A /* HSLCircularPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HSLCircularPickerView.swift; sourceTree = "<group>"; };
 		137488D2191C5720BA69355D /* SavantUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SavantUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		143D9136DB0B10D4BEDE21FC /* NoteRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteRowView.swift; sourceTree = "<group>"; };
 		1654113E986B4B201E5A2394 /* Savant.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Savant.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		230C6FD7AA92E96607709BA6 /* RandomSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RandomSection.swift; sourceTree = "<group>"; };
 		2628B9A082BCF2015D3A4508 /* NewSpaceFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSpaceFlowView.swift; sourceTree = "<group>"; };
 		2F2A5252759CDE2E80E97010 /* FolderRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderRowView.swift; sourceTree = "<group>"; };
 		35208B6FE5071CF7F1027ABD /* MacNotesSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacNotesSidebar.swift; sourceTree = "<group>"; };
+		39103A47AECDE707FEDBE522 /* DragGhostOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragGhostOverlay.swift; sourceTree = "<group>"; };
+		39DABF8E29B9D98A64A29C69 /* DragLiftGesture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragLiftGesture.swift; sourceTree = "<group>"; };
 		3D6C2E909A31355FAFB262CB /* FoundationModelServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationModelServices.swift; sourceTree = "<group>"; };
 		41E376E47A71AB623E7E0BBB /* GlassViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassViews.swift; sourceTree = "<group>"; };
 		44604743135560F4679CC526 /* NoteEditPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteEditPage.swift; sourceTree = "<group>"; };
@@ -106,7 +111,6 @@
 		489D34A2482E92B07A606D88 /* SpaceHeaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceHeaderView.swift; sourceTree = "<group>"; };
 		56E077784985271F419EC997 /* PersistenceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistenceController.swift; sourceTree = "<group>"; };
 		59572A160BD9716D35FFA6E7 /* FavoritesTileRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FavoritesTileRow.swift; sourceTree = "<group>"; };
-		5BB1DEFAA27A0DCF619FEC32 /* DraggableItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraggableItem.swift; sourceTree = "<group>"; };
 		602F31A12558BAD14FD13772 /* View+Keyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+Keyboard.swift"; sourceTree = "<group>"; };
 		69362E0690FE857DB636C4E0 /* ArchiveBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchiveBrowserView.swift; sourceTree = "<group>"; };
 		6A6EC02B34A8F54989A60766 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
@@ -117,19 +121,21 @@
 		81B1BF33203E7A384A732526 /* ZenGradientPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZenGradientPicker.swift; sourceTree = "<group>"; };
 		85ED9BDC6E9F78D20A59A5D5 /* MacNoteWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacNoteWorkspace.swift; sourceTree = "<group>"; };
 		8E86CD4BDC2CDD375D06AC94 /* SpaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceView.swift; sourceTree = "<group>"; };
-		91478E1FDD3292152702A1F3 /* DropZones.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DropZones.swift; sourceTree = "<group>"; };
+		91C1486FCC307C41C061CF13 /* TouchDragSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchDragSession.swift; sourceTree = "<group>"; };
 		92C83E44F84187D819128D6E /* ExpandableGlassMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExpandableGlassMenu.swift; sourceTree = "<group>"; };
 		93894CA1F741852EE27189B3 /* SpaceGradient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceGradient.swift; sourceTree = "<group>"; };
 		971235DEEEE78B209127BD68 /* FolderService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderService.swift; sourceTree = "<group>"; };
-		9A65B28ED5260A625E98C61F /* DragPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragPreview.swift; sourceTree = "<group>"; };
 		9C4C97B48016127AB40DEE50 /* SearchSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchSheet.swift; sourceTree = "<group>"; };
 		AC63B6C98D5B20EA5293DAE5 /* InteractionMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionMode.swift; sourceTree = "<group>"; };
 		AD3FBE920CA55A9ACFEEE481 /* OnboardingFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingFlow.swift; sourceTree = "<group>"; };
 		AEC17E73406085D68AC70FB7 /* NoteReadSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteReadSheet.swift; sourceTree = "<group>"; };
 		B0E8843E68FB964F30A74766 /* SettingsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSheet.swift; sourceTree = "<group>"; };
+		B294C1805D7AFE1CC1B32DD7 /* TierRowsBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TierRowsBuilder.swift; sourceTree = "<group>"; };
+		B477DB6C666E1A71552EE1CC /* GrainOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrainOverlay.swift; sourceTree = "<group>"; };
 		B5F3B07204C6F6C360684421 /* MacRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacRootView.swift; sourceTree = "<group>"; };
 		B6D4BBACD44434F19B6517E2 /* View+HoverTracking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+HoverTracking.swift"; sourceTree = "<group>"; };
 		CDA3E541FA1E22277EC2F5D7 /* TidyBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TidyBannerView.swift; sourceTree = "<group>"; };
+		CEF42DEFDA45304B5965A507 /* SavantTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavantTheme.swift; sourceTree = "<group>"; };
 		DC21ED8686A26A1826788D56 /* MultiSelectActionBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiSelectActionBar.swift; sourceTree = "<group>"; };
 		DC5D64FBA1B18B4684ECF141 /* BackgroundTaskScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundTaskScheduler.swift; sourceTree = "<group>"; };
 		E908B5D51A276D30DE021751 /* SavantUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavantUITests.swift; sourceTree = "<group>"; };
@@ -173,6 +179,17 @@
 				56E077784985271F419EC997 /* PersistenceController.swift */,
 			);
 			path = Services;
+			sourceTree = "<group>";
+		};
+		0A4E567560E58414B578C83A /* Drag */ = {
+			isa = PBXGroup;
+			children = (
+				39103A47AECDE707FEDBE522 /* DragGhostOverlay.swift */,
+				39DABF8E29B9D98A64A29C69 /* DragLiftGesture.swift */,
+				B294C1805D7AFE1CC1B32DD7 /* TierRowsBuilder.swift */,
+				91C1486FCC307C41C061CF13 /* TouchDragSession.swift */,
+			);
+			path = Drag;
 			sourceTree = "<group>";
 		};
 		193FDC58DFC08609AB59A345 /* Products */ = {
@@ -231,20 +248,17 @@
 		7F654242C670D2D1DD79CB73 /* Home */ = {
 			isa = PBXGroup;
 			children = (
-				5BB1DEFAA27A0DCF619FEC32 /* DraggableItem.swift */,
-				9A65B28ED5260A625E98C61F /* DragPreview.swift */,
-				91478E1FDD3292152702A1F3 /* DropZones.swift */,
 				59572A160BD9716D35FFA6E7 /* FavoritesTileRow.swift */,
 				2F2A5252759CDE2E80E97010 /* FolderRowView.swift */,
 				DC21ED8686A26A1826788D56 /* MultiSelectActionBar.swift */,
 				143D9136DB0B10D4BEDE21FC /* NoteRowView.swift */,
-				0867907D732AE24CDB7F06F7 /* PinnedSection.swift */,
-				230C6FD7AA92E96607709BA6 /* RandomSection.swift */,
 				489D34A2482E92B07A606D88 /* SpaceHeaderView.swift */,
 				EB724E880E5CF0ED811D7984 /* SpacePagerView.swift */,
 				8E86CD4BDC2CDD375D06AC94 /* SpaceView.swift */,
 				CDA3E541FA1E22277EC2F5D7 /* TidyBannerView.swift */,
 				EF1A85859089622388313BC7 /* TidyReviewSheet.swift */,
+				0F26EC4E4379DC85661C8AD9 /* TierRowList.swift */,
+				0A4E567560E58414B578C83A /* Drag */,
 			);
 			path = Home;
 			sourceTree = "<group>";
@@ -269,7 +283,9 @@
 			children = (
 				92C83E44F84187D819128D6E /* ExpandableGlassMenu.swift */,
 				41E376E47A71AB623E7E0BBB /* GlassViews.swift */,
+				B477DB6C666E1A71552EE1CC /* GrainOverlay.swift */,
 				132DE57710029C0A3B356D7A /* HSLCircularPickerView.swift */,
+				CEF42DEFDA45304B5965A507 /* SavantTheme.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -386,7 +402,7 @@
 			path = NoteSheet;
 			sourceTree = "<group>";
 		};
-		"TEMP_C508C3A4-F987-4336-BBB7-0ECD94DFE5EA" /* Resources */ = {
+		"TEMP_CBA3CD79-0909-4599-A6FD-0ECB74F4F99F" /* Resources */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -538,15 +554,15 @@
 				6FA2220F204F604A9DB87FF8 /* ArchiveBrowserView.swift in Sources */,
 				3253544AD41D182CA70DA49D /* BackgroundTaskScheduler.swift in Sources */,
 				6EACA0B81DD4056E72D956F0 /* Color+Scheme.swift in Sources */,
-				08E84B29C32238707E66BEDE /* DragPreview.swift in Sources */,
-				580FE2E1D5A00C5810AEFD6C /* DraggableItem.swift in Sources */,
-				91B613F6A829B58214F38407 /* DropZones.swift in Sources */,
+				AFD6FCD38F3CFFEDEDA88689 /* DragGhostOverlay.swift in Sources */,
+				8231825A2C3F1BE1F847D245 /* DragLiftGesture.swift in Sources */,
 				C650D4645B57FA6E54C0F035 /* ExpandableGlassMenu.swift in Sources */,
 				8B4F821BBFEBDA592C141C24 /* FavoritesTileRow.swift in Sources */,
 				2D06284F8C57ACD97298AC2C /* FolderRowView.swift in Sources */,
 				F39F225910CA52B1145DFEFC /* FolderService.swift in Sources */,
 				740C3609F5248B44A1CDD105 /* FoundationModelServices.swift in Sources */,
 				12654BDAB6AD3068A517AE68 /* GlassViews.swift in Sources */,
+				C4B2788A741399FBA4AC781E /* GrainOverlay.swift in Sources */,
 				8041C150748E97D65675E1AB /* HSLCircularPickerView.swift in Sources */,
 				639D3697859247EE5451A96F /* InputBarView.swift in Sources */,
 				614C0D8E490F8D528518271D /* InteractionMode.swift in Sources */,
@@ -558,9 +574,8 @@
 				0D0B6E8068C20CD332280A2A /* NoteRowView.swift in Sources */,
 				203DB5DCFEA0EC35498AD68C /* OnboardingFlow.swift in Sources */,
 				C3CC496532354557EF8D1ECF /* PersistenceController.swift in Sources */,
-				0E469D491F6A8E14EA8CF134 /* PinnedSection.swift in Sources */,
-				AB294EFA1BACE6E5D4E970F6 /* RandomSection.swift in Sources */,
 				E3B6DAA540F1126C1C0E9487 /* SavantApp.swift in Sources */,
+				97812395D684AC6A1F4143D5 /* SavantTheme.swift in Sources */,
 				A48F01A55F416D5A2291E1C1 /* SearchSheet.swift in Sources */,
 				785D88819CD66481952F966B /* SettingsSheet.swift in Sources */,
 				ADF5A73E9B2636BC3E7B7C36 /* SpaceGradient.swift in Sources */,
@@ -570,6 +585,9 @@
 				E5EFFC26941F3B02D9EEA807 /* SpaceView.swift in Sources */,
 				874BB2F9DC4FA5FABA74C6EA /* TidyBannerView.swift in Sources */,
 				49991B43732CF9993443F25B /* TidyReviewSheet.swift in Sources */,
+				3F7E01E82CC8F3D1A996F219 /* TierRowList.swift in Sources */,
+				23C8E0550134B8944937D99D /* TierRowsBuilder.swift in Sources */,
+				D925F493D82F11D241DC17F8 /* TouchDragSession.swift in Sources */,
 				FDB75934F3C23EDC0C2B1972 /* View+HoverTracking.swift in Sources */,
 				0E0B35703DFD5AB9620DEB5E /* View+Keyboard.swift in Sources */,
 			);
@@ -591,6 +609,7 @@
 				10B1273E5210058308B545FC /* Color+Scheme.swift in Sources */,
 				8BC7BF673D2E21FFD0566A68 /* FolderService.swift in Sources */,
 				468F9261BCF4085478C936E0 /* FoundationModelServices.swift in Sources */,
+				711724606FED94DDC2D87C2E /* GrainOverlay.swift in Sources */,
 				40C9EF590E5CE240768BE055 /* InteractionMode.swift in Sources */,
 				433C1B63FC03435371E9A6BC /* MacCommandPalette.swift in Sources */,
 				83AC936F8A064927BA9C8C64 /* MacCreateSpaceForm.swift in Sources */,
@@ -601,6 +620,7 @@
 				C5638E020995B8E7677CE94C /* Models.swift in Sources */,
 				DB35F7786E6B019BB616FE77 /* PersistenceController.swift in Sources */,
 				758C01920B0DE21C264CD7BD /* SavantApp.swift in Sources */,
+				322FF7F6B5814185DF5CA1CA /* SavantTheme.swift in Sources */,
 				9E2A6FFBC81AC736E11D3AB4 /* SpaceGradient.swift in Sources */,
 				223A628E1F6BE6B8F33AE875 /* View+HoverTracking.swift in Sources */,
 				8A105730B5D5C390B98CB8C7 /* ZenColorWheel.swift in Sources */,

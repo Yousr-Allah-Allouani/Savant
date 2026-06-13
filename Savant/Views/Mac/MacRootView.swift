@@ -86,7 +86,12 @@ struct MacRootView: View {
     @State private var editorFrame: CGRect = .zero
     @State private var sidebarWidth: CGFloat = 300
     @State private var lastExpandedSidebarWidth: CGFloat = 300
-    @State private var spacePageOffset: CGFloat = 0 // fractional page index, animated
+    /// Fractional page index for the space pager, animated. Lives in its own
+    /// @Observable model (NOT @State) so per-frame swipe updates invalidate
+    /// only the views that read it in their own body — the backdrop and the
+    /// sidebar's column-offset modifier — instead of re-evaluating the whole
+    /// window tree (sidebar columns + editor) on every swipe frame.
+    @State private var pager = SpacePagerModel()
     @State private var swipeSettleGeneration = 0
     @State private var spaceAnimationGeneration = 0
     @State private var swipeStartPageOffset: CGFloat?
@@ -122,7 +127,7 @@ struct MacRootView: View {
     private var rootContent: some View {
         MacSpaceBackdrop(
             spaces: spaces,
-            pageOffset: spacePageOffset,
+            pager: pager,
             previewGradient: previewGradient
         )
 
@@ -252,7 +257,7 @@ struct MacRootView: View {
             folders: folders,
             selectedSpaceID: $selectedSpaceID,
             selectedNoteIDsBySpace: $selectedNoteIDsBySpace,
-            spacePageOffset: spacePageOffset,
+            pager: pager,
             previewGradient: $previewGradient,
             searchResetToken: sidebarSearchResetToken,
             width: width,
@@ -734,18 +739,14 @@ struct MacRootView: View {
         return Color.spaceColor(lightHex: space.colorHex, darkHex: space.darkColorHex, scheme: colorScheme)
     }
 
-    /// Continuous color interpolation driven by the sidebar pager's scroll
-    /// offset. `spacePageOffset` is fractional (e.g. 1.4 means we're 40% of
-    /// the way from space[1] to space[2]).
+    /// Active-space tint for the palette + hover-sidebar overlays. Deliberately
+    /// NOT driven by the fractional pager offset: reading `pager.pageOffset`
+    /// here would re-register the whole root body on every swipe frame —
+    /// exactly the per-frame invalidation the pager model exists to avoid.
+    /// The continuously-interpolated tint lives in `MacSpaceBackdrop`, which
+    /// reads the pager in its own (cheap) body.
     private var displaySpaceColor: Color {
-        guard !spaces.isEmpty else { return color(for: nil) }
-        let clamped = max(0, min(CGFloat(spaces.count - 1), spacePageOffset))
-        let floorIdx = Int(clamped.rounded(.down))
-        let ceilIdx = min(floorIdx + 1, spaces.count - 1)
-        let t = clamped - CGFloat(floorIdx)
-        let a = color(for: spaces[floorIdx])
-        let b = color(for: spaces[ceilIdx])
-        return a.mixed(with: b, by: t)
+        color(for: selectedSpace)
     }
 
     /// The visual stack + overlays + base window modifiers. Split out so the
@@ -768,8 +769,14 @@ struct MacRootView: View {
 
     var body: some View {
         shell
-        // Re-evaluate the editor drop side as the drag moves.
-        .onChange(of: dragSession.translation) { _, _ in updateEditorDropSide() }
+        // Re-evaluate the editor drop side as the drag moves. The observation
+        // lives in a zero-size leaf view: putting `.onChange(of:
+        // dragSession.translation)` directly here read `translation` during
+        // THIS body's evaluation, re-running the entire window tree (sidebar
+        // columns + editor) on every drag frame.
+        .background {
+            DragFrameWatcher(session: dragSession) { updateEditorDropSide() }
+        }
         .confirmationDialog(
             "Delete space?",
             isPresented: Binding(
@@ -842,12 +849,12 @@ struct MacRootView: View {
             }
             guard let id = newID, let idx = spaces.firstIndex(where: { $0.id == id }) else { return }
             let targetOffset = CGFloat(idx)
-            guard abs(spacePageOffset - targetOffset) > 0.001 else { return }
+            guard abs(pager.pageOffset - targetOffset) > 0.001 else { return }
             animateSpacePageOffset(to: targetOffset, velocityPages: 0)
         }
         .onChange(of: spaces.map(\.id)) { _, _ in
             if let id = selectedSpaceID, let idx = spaces.firstIndex(where: { $0.id == id }) {
-                spacePageOffset = CGFloat(idx)
+                pager.pageOffset = CGFloat(idx)
             }
         }
         .task {
@@ -888,11 +895,11 @@ struct MacRootView: View {
         swipeSettleGeneration &+= 1
         spaceAnimationGeneration &+= 1
         isSpaceSettling = false
-        swipeStartPageOffset = clampedPageOffset(spacePageOffset)
+        swipeStartPageOffset = clampedPageOffset(pager.pageOffset)
     }
 
     /// Per-event update from the swipe monitor. Translates accumulated
-    /// horizontal point delta into a fractional `spacePageOffset` so the
+    /// horizontal point delta into a fractional `pager.pageOffset` so the
     /// per-space column tracks fingers in real time. A single swipe can
     /// only ever reveal the immediately-adjacent space.
     private func applySwipeProgress(_ totalDx: CGFloat) {
@@ -909,7 +916,7 @@ struct MacRootView: View {
         let neighborUpperIdx = CGFloat(min(spaces.count - 1, baseIdx + 1))
         let raw = baseOffset + trackedPageDelta
         let clamped = min(max(raw, neighborLowerIdx), neighborUpperIdx)
-        if abs(spacePageOffset - clamped) > 0.001 {
+        if abs(pager.pageOffset - clamped) > 0.001 {
             setSpacePageOffset(clamped)
         }
     }
@@ -971,7 +978,7 @@ struct MacRootView: View {
         velocityPages: CGFloat,
         completion: (() -> Void)? = nil
     ) {
-        let startOffset = clampedPageOffset(spacePageOffset)
+        let startOffset = clampedPageOffset(pager.pageOffset)
         let distance = abs(targetOffset - startOffset)
         guard distance > 0.001 else {
             setSpacePageOffset(targetOffset)
@@ -984,10 +991,19 @@ struct MacRootView: View {
         let duration = spaceSettleDuration(distancePages: distance, velocityPages: velocityPages)
         isSpaceSettling = true
 
-        withAnimation(spaceSettleAnimation(duration: duration), completionCriteria: .removed) {
-            spacePageOffset = targetOffset
+        withAnimation(spaceSettleAnimation(duration: duration), completionCriteria: .logicallyComplete) {
+            pager.pageOffset = targetOffset
         } completion: {
             guard spaceAnimationGeneration == animationGeneration else { return }
+            setSpacePageOffset(targetOffset)
+            isSpaceSettling = false
+            completion?()
+        }
+        // Watchdog: .logicallyComplete on @Observable can still miss in edge cases.
+        // Force-clear after the animation window elapses.
+        let gen = animationGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.25) { [self] in
+            guard spaceAnimationGeneration == gen, isSpaceSettling else { return }
             setSpacePageOffset(targetOffset)
             isSpaceSettling = false
             completion?()
@@ -1010,11 +1026,11 @@ struct MacRootView: View {
 
     private func setSpacePageOffset(_ offset: CGFloat) {
         let next = clampedPageOffset(offset)
-        guard abs(spacePageOffset - next) > 0.0005 else { return }
+        guard abs(pager.pageOffset - next) > 0.0005 else { return }
         var tx = Transaction()
         tx.disablesAnimations = true
         withTransaction(tx) {
-            spacePageOffset = next
+            pager.pageOffset = next
         }
     }
 
@@ -1694,9 +1710,35 @@ private struct CreationModeEmptyPane: View {
 /// saved-gradient crossfade (for gradient-config spaces), and the live
 /// preview gradient during space creation. Extracted from MacRootView's
 /// body so the type-checker isn't asked to chew the whole scene at once.
+/// Fractional space-pager offset (1.4 = 40% of the way from space[1] to
+/// space[2]). An @Observable model rather than root @State so that per-frame
+/// swipe updates invalidate only the leaf views that read it in their own
+/// body (the backdrop + the sidebar's column-offset modifier) — never the
+/// whole window tree.
+@Observable
+@MainActor
+final class SpacePagerModel {
+    var pageOffset: CGFloat = 0
+}
+
+/// Zero-size leaf that re-evaluates on every drag frame and forwards the
+/// tick. Isolates per-frame `session.translation` observation from whatever
+/// view owns the handler (their bodies stay un-invalidated).
+struct DragFrameWatcher: View {
+    let session: CrossTierDragSession
+    let onFrame: () -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: session.translation) { _, _ in onFrame() }
+    }
+}
+
 private struct MacSpaceBackdrop: View {
     let spaces: [Space]
-    let pageOffset: CGFloat
+    let pager: SpacePagerModel
     let previewGradient: ZenGradientConfig?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -1720,7 +1762,7 @@ private struct MacSpaceBackdrop: View {
 
     private var displaySpaceColor: Color {
         guard !spaces.isEmpty else { return color(for: nil) }
-        let clamped = max(0, min(CGFloat(spaces.count - 1), pageOffset))
+        let clamped = max(0, min(CGFloat(spaces.count - 1), pager.pageOffset))
         let floorIdx = Int(clamped.rounded(.down))
         let ceilIdx = min(floorIdx + 1, spaces.count - 1)
         let t = clamped - CGFloat(floorIdx)
@@ -1730,7 +1772,7 @@ private struct MacSpaceBackdrop: View {
     @ViewBuilder
     private var gradientLayer: some View {
         if !spaces.isEmpty {
-            let clamped = max(0, min(CGFloat(spaces.count - 1), pageOffset))
+            let clamped = max(0, min(CGFloat(spaces.count - 1), pager.pageOffset))
             let floorIdx = Int(clamped.rounded(.down))
             let ceilIdx = min(floorIdx + 1, spaces.count - 1)
             let t = Double(clamped - CGFloat(floorIdx))

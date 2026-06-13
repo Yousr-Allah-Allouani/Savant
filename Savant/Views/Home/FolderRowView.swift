@@ -1,89 +1,87 @@
 import SwiftData
 import SwiftUI
 
+/// Folder HEADER row only — children render as separate flat rows in the
+/// section's single ForEach (`TierRowsBuilder`), so the drag engine can
+/// shuffle them with their header as one block.
 struct FolderRowView: View {
-    @Environment(InteractionMode.self) private var interaction
-    @Environment(\.modelContext) private var modelContext
+    @Environment(TouchDragSession.self) private var session
 
     let folder: Folder
-    let notes: [Note]
-    let spaces: [Space]
-    let currentSpace: Space
+    let count: Int
     let isExpanded: Bool
     let toggleExpanded: () -> Void
-
-    @State private var isTargeted = false
+    let tier: NoteTier
+    /// Non-nil for a SUBFOLDER row — it lifts as a child of that folder, so
+    /// the engine resolves it like any other child block (sibling reorder,
+    /// drag-out, nest elsewhere).
+    let parentFolderID: UUID?
+    /// Collapses an expanded folder just before the lift so it drags as a
+    /// single header row (re-expanded by `onSettled`).
+    let onWillLift: () -> Void
+    let onSettled: () -> Void
 
     var body: some View {
-        let dragActive = interaction.isDragging
+        let isNestTarget = session.nestTargetFolderID == folder.id
 
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 10) {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.caption.weight(.bold))
-                    .frame(width: 12)
-                Image(systemName: "folder.fill")
-                    .foregroundStyle(.primary.opacity(0.72))
-                Text(folder.name)
-                    .font(.system(.body, design: .rounded).weight(.medium))
-                    .foregroundStyle(.savantInk)
-                Spacer()
-                Text("\(notes.count)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        FolderRowCard(folder: folder, count: count, isExpanded: isExpanded, tier: tier)
+            .overlay {
+                if isNestTarget {
+                    RoundedRectangle(cornerRadius: SavantTheme.rowRadius, style: .continuous)
+                        .stroke(.primary.opacity(0.4), lineWidth: 1.5)
+                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .contentShape(.rect)
+            .scaleEffect(isNestTarget ? 1.02 : 1)
+            .animation(.easeOut(duration: 0.15), value: isNestTarget)
+            .contentShape(.rect(cornerRadius: SavantTheme.rowRadius))
             .onTapGesture { toggleExpanded() }
-            .dropZoneAura(active: dragActive, targeted: isTargeted, cornerRadius: 12)
-            .dropDestination(for: DraggedItemTransfer.self) { items, _ in
-                handleDrop(items)
-            } isTargeted: { isTargeted = $0 }
-            .draggable(DraggedItemTransfer.folder(folder.id)) {
-                FolderDragPreview(folder: folder)
-                    .dragLifecycleHook(interaction)
-            }
-            .contextMenu {
-                Button("Rename", systemImage: "pencil") { }
-                Button(isExpanded ? "Collapse" : "Expand", systemImage: isExpanded ? "chevron.up" : "chevron.down") {
-                    toggleExpanded()
-                }
-                Button("Delete folder", systemImage: "trash", role: .destructive) {
-                    do {
-                        try FolderService(context: modelContext).delete(folder)
-                    } catch {
-                        assertionFailure("Folder delete failed: \(error)")
-                    }
-                }
-            }
-
-            if isExpanded {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(notes) { note in
-                        NoteRowView(note: note, spaces: spaces, currentSpace: currentSpace, showsPreview: folder.tier == .pinned)
-                            .padding(.leading, 30)
-                    }
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
-        }
-        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isExpanded)
+            .dragRow(
+                id: folder.id,
+                payload: .folder(folder.id),
+                tier: tier,
+                parentFolderID: parentFolderID,
+                spaceID: folder.space?.id,
+                ghost: { .folder(folder, count: count) },
+                onWillLift: onWillLift,
+                onSettled: onSettled
+            )
     }
+}
 
-    private func handleDrop(_ items: [DraggedItemTransfer]) -> Bool {
-        guard let first = items.first, first.kind == .note else { return false }
-        let folderService = FolderService(context: modelContext)
-        do {
-            let descriptor = FetchDescriptor<Note>(predicate: #Predicate { $0.id == first.id })
-            if let note = try modelContext.fetch(descriptor).first {
-                try folderService.moveNote(note, into: folder)
-                return true
-            }
-        } catch {
-            assertionFailure("Folder drop failed: \(error)")
+/// The bare header card — shared between the in-list row and the drag ghost.
+/// `tier` drives the style (NOT `folder.tier`): in the kept section the
+/// header carries the same presence as a kept note row, and the ghost passes
+/// the tier it's currently morphing toward.
+struct FolderRowCard: View {
+    let folder: Folder
+    let count: Int
+    let isExpanded: Bool
+    let tier: NoteTier
+
+    private var isProminent: Bool { tier == .pinned }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 15))
+                .foregroundStyle(.savantSubtleInk)
+            Text(folder.name)
+                .font(.system(size: 17, design: .rounded).weight(.medium))
+                .foregroundStyle(.savantInk)
+                .lineLimit(1)
+            Spacer()
+            Text("\(count)")
+                .font(.system(.caption, design: .rounded).weight(.semibold))
+                .foregroundStyle(.secondary)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.savantSubtleInk)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
         }
-        return false
+        .padding(.horizontal, 18)
+        .padding(.vertical, isProminent ? 13 : 12)
+        .frame(minHeight: isProminent ? 62 : 48)
+        .savantCard(radius: SavantTheme.rowRadius, soft: !isProminent)
     }
 }
 
