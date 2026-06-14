@@ -40,10 +40,14 @@ struct TierRowList: View {
 
         VStack(alignment: .leading, spacing: SavantTheme.rowSpacing) {
             if layout.rows.isEmpty {
-                if session.isActive {
-                    TierDropBand(tier: tier)
-                } else if showsEmptyHint {
+                if showsEmptyHint {
+                    // Flow's hint is always present and IS its drop target — so
+                    // nothing changes at drag start.
                     emptyHint
+                } else if session.revealsEmptyBand(tier) {
+                    // Kept: the band grows in ONLY as the ghost nears this slot
+                    // (proximity reveal), never on lift.
+                    TierDropBand(tier: tier)
                 }
             } else {
                 ForEach(layout.rows) { row in
@@ -58,6 +62,9 @@ struct TierRowList: View {
         // when it's the cross-tier target (and shrinks once its row leaves).
         .padding(.bottom, bottomAdjustment)
         .animation(session.isActive ? TouchDragSession.rowShuffle : nil, value: bottomAdjustment)
+        // The proximity band grows/collapses smoothly (it shifts the tiers
+        // below) instead of popping.
+        .animation(TouchDragSession.rowShuffle, value: session.revealsEmptyBand(tier))
         .onGeometryChange(for: ActiveFrame.self) { proxy in
             ActiveFrame(frame: proxy.frame(in: .named("spaceContent")), active: isActivePage)
         } action: { report in

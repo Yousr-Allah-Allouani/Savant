@@ -71,6 +71,9 @@ struct DragLiftGesture: UIGestureRecognizerRepresentable {
             // One finger only: extra touches stay with the scroll views, so
             // a second finger can page the pager mid-drag.
             guard gestureRecognizer.numberOfTouches == 0 else { return false }
+            // Self-heal a drag that died without a clean end (orphaned the
+            // recognizer) — otherwise every lift after it is silently blocked.
+            session.clearIfOrphaned()
             return session.canLift(atGlobal: touch.location(in: nil))
         }
     }
@@ -100,31 +103,15 @@ struct DragSpaceSwipeGesture: UIGestureRecognizerRepresentable {
         _ recognizer: UIPanGestureRecognizer, context: Context
     ) {
         switch recognizer.state {
-        case .began:
-            print("🧭 DRAG-PROBE steering pan began")
-            context.coordinator.lastFiredX = 0
-            context.coordinator.firedDirection = 0
         case .changed:
-            let x = recognizer.translation(in: nil).x
-            let step = x - context.coordinator.lastFiredX
-            if abs(step) > 70 {
-                let direction = step < 0 ? 1 : -1
-                // Direction-latched per pan: once a swipe pages one way, the
-                // finger decelerating/rebounding can't fire the reverse and
-                // bounce the drag back. Multi-space swipes (same direction)
-                // still chain.
-                if context.coordinator.firedDirection == 0
-                    || context.coordinator.firedDirection == direction {
-                    context.coordinator.lastFiredX = x
-                    context.coordinator.firedDirection = direction
-                    // Swiping left carries the drag to the NEXT space (content
-                    // moves left), matching the pager's own direction.
-                    session.switchSpace(by: direction)
-                } else {
-                    // Reverse travel: re-anchor so it doesn't accumulate.
-                    context.coordinator.lastFiredX = x
-                }
-            }
+            // Stream the raw translation; the pager drives the inner pager 1:1.
+            session.steerChanged?(recognizer.translation(in: nil).x)
+        case .ended, .cancelled, .failed:
+            // Hand over a predicted endpoint (translation + a slice of velocity)
+            // so a quick flick still pages and a slow half-swipe snaps back.
+            let tx = recognizer.translation(in: nil).x
+            let vx = recognizer.velocity(in: nil).x
+            session.steerEnded?(tx + vx * 0.12)
         default:
             break
         }
@@ -133,9 +120,6 @@ struct DragSpaceSwipeGesture: UIGestureRecognizerRepresentable {
     @MainActor
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         let session: TouchDragSession
-        var lastFiredX: CGFloat = 0
-        /// 0 until the pan fires its first switch, then locked to ±1.
-        var firedDirection: Int = 0
 
         init(session: TouchDragSession) {
             self.session = session

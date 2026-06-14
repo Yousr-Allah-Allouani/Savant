@@ -133,6 +133,16 @@ final class TouchDragSession {
     private(set) var settleFades = false
     private(set) var ghost: GhostSpec?
 
+    /// Empty Essentials/Kept tiers whose insertion band is currently revealed
+    /// (the ghost is near their resting slot). Observed, but only flips on a
+    /// threshold crossing — NOT every finger frame — so the tier views
+    /// re-render on reveal/collapse, never continuously.
+    private(set) var revealedEmptyBands: Set<NoteTier> = []
+
+    func revealsEmptyBand(_ tier: NoteTier) -> Bool {
+        revealedEmptyBands.contains(tier)
+    }
+
     /// Quantized auto-scroll velocity (pt per tick). Observed ONLY by the
     /// `AutoScrollDriver` leaf in the active `SpaceView`.
     private(set) var autoScrollVelocity: CGFloat = 0
@@ -284,6 +294,12 @@ final class TouchDragSession {
     @ObservationIgnored var orderedSpaceIDs: [UUID] = []
     /// Set by the pager: animate the pager to the given space.
     @ObservationIgnored var requestSpaceSwitch: ((UUID) -> Void)?
+    /// Continuous second-finger steering (Phase C). The gesture streams its
+    /// horizontal translation to `steerChanged` (the pager turns it into a live
+    /// 1:1 inner-pager offset — drag partway, reverse to cancel), then hands the
+    /// predicted endpoint to `steerEnded`, which snaps to the nearest page.
+    @ObservationIgnored var steerChanged: ((CGFloat) -> Void)?
+    @ObservationIgnored var steerEnded: ((CGFloat) -> Void)?
     @ObservationIgnored private(set) var sourceSpaceID: UUID?
     @ObservationIgnored private var activeSpaceID: UUID?
     @ObservationIgnored private var edgeDirection = 0
@@ -324,10 +340,27 @@ final class TouchDragSession {
         liftableID(atGlobal: point) != nil
     }
 
+    /// Recovery net. A new first touch is landing (the delegate already
+    /// confirmed this recognizer holds no touches), yet the session still
+    /// thinks a drag is in flight — a previous drag's recognizer died without a
+    /// clean terminal state (a layout churn mid-drag can orphan it), so its
+    /// settle/watchdog never reset us and EVERY future lift was being blocked
+    /// (`liftableID`/`beginDrag` bail while active/settling). Clear it so the
+    /// new lift can proceed. Safe: a legitimately live drag holds the touch, so
+    /// the delegate's `numberOfTouches == 0` guard means we're not one.
+    func clearIfOrphaned() {
+        guard isActive || isSettling else { return }
+        guard recognizerStillTracking?() != true else { return }
+        print("🧭 DRAG-PROBE cleared orphaned session before new lift")
+        dragGeneration += 1   // invalidate any still-pending settle/watchdog
+        reset()
+    }
+
     /// The root recognizer recognized: resolve the row under the finger and
     /// start its drag.
     func lift(atGlobal point: CGPoint) {
         guard let id = liftableID(atGlobal: point), let spec = liftables[id] else { return }
+        print("🧭 DRAG-PROBE lift → tier=\(spec.tier) payload=\(spec.payload)")
         spec.onWillLift?()
         beginDrag(
             payload: spec.payload,
@@ -345,14 +378,28 @@ final class TouchDragSession {
             x: point.x - contentOriginGlobal.x,
             y: point.y - contentOriginGlobal.y
         )
+        // Gather EVERY liftable whose frame contains the point, then pick the
+        // one whose center is closest — `liftables` is an unordered dict, so a
+        // bare "first match" could grab the wrong row when frames overlap (e.g.
+        // a stale Essentials card frame straddling a Pinned row). Closest-center
+        // resolves to the row the finger is actually on.
+        var best: (id: UUID, distSq: CGFloat)?
+        var matches: [(NoteTier, CGRect)] = []
         for (id, spec) in liftables {
             guard spec.isEnabled,
                   spec.spaceID == nil || spec.spaceID == activeSpaceID,
                   let frame = rowFrames[id], frame.contains(content)
             else { continue }
-            return id
+            matches.append((spec.tier, frame))
+            let dx = frame.midX - content.x
+            let dy = frame.midY - content.y
+            let d = dx * dx + dy * dy
+            if best == nil || d < best!.distSq { best = (id, d) }
         }
-        return nil
+        if matches.count > 1 {
+            print("🧭 DRAG-PROBE liftableID AMBIGUOUS content=\(content) origin=\(contentOriginGlobal) candidates=\(matches.map { "\($0.0):\($0.1.integral)" })")
+        }
+        return best?.id
     }
 
     // MARK: - Grid geometry (Essentials)
@@ -531,6 +578,35 @@ final class TouchDragSession {
     private func refreshTargets() {
         retargetTierIfNeeded()
         resolveZone()
+        updateEmptyBandReveals()
+    }
+
+    /// PRINCIPLE: entering a drag must never abruptly shove the layout. An
+    /// empty Essentials/Kept tier therefore stays collapsed at lift and only
+    /// grows its insertion band once the ghost actually approaches its slot —
+    /// so the band follows the drag instead of popping in above it (which used
+    /// to push the source rows out from under the finger). Flow keeps its
+    /// always-present empty hint as its own target, so it's not listed here.
+    private func updateEmptyBandReveals() {
+        guard isActive, !isSettling, let payload else {
+            if !revealedEmptyBands.isEmpty { revealedEmptyBands = [] }
+            return
+        }
+        let y = ghostCenterContent.y
+        var revealed: Set<NoteTier> = []
+        for tier in [NoteTier.favorite, .pinned] {
+            guard let context = tierContexts[tier], context.blocks.isEmpty,
+                  (payload.isNote ? context.acceptsNotes : context.acceptsFolders),
+                  let frame = tierFrames[tier]
+            else { continue }
+            // Hysteresis: a wider keep-band once shown, so the reveal (which
+            // grows the frame) doesn't flicker at the boundary.
+            let margin: CGFloat = revealedEmptyBands.contains(tier) ? 95 : 55
+            if y >= frame.minY - margin, y <= frame.maxY + margin {
+                revealed.insert(tier)
+            }
+        }
+        if revealed != revealedEmptyBands { revealedEmptyBands = revealed }
     }
 
     func endDrag(cancelled: Bool = false) {
@@ -663,6 +739,7 @@ final class TouchDragSession {
         sourceSpaceID = nil
         edgeDirection = 0
         edgeFireToken = UUID()
+        revealedEmptyBands = []
     }
 
     private func clearTarget() {

@@ -1,129 +1,42 @@
 import SwiftData
 import SwiftUI
 
+/// One space's note rows — Kept (pinned) + Flow (random) — and nothing else.
+/// This is the ONLY part of a space that translates horizontally when you swipe
+/// between spaces; the header and the Essentials grid are anchored siblings
+/// owned by `SpacePagerView`. The column lives inside the inner paging scroll,
+/// which itself sits in the shared outer vertical scroll, so this view has no
+/// ScrollView of its own — it just reports its natural height up so the pager
+/// can size the page.
 struct SpaceView: View {
-    @Environment(\.modelContext) private var modelContext
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(TouchDragSession.self) private var dragSession
-    @State private var interaction = InteractionMode()
-    @State private var scrollPosition = ScrollPosition()
 
     let space: Space
     let spaces: [Space]
     let notes: [Note]
     let folders: [Folder]
-    let latestTidyRun: TidyRun?
     let selectedIndex: Int
-    let selectSpaceAtIndex: (Int) -> Void
-    var topInset: CGFloat = 0
-    let tidyNow: () -> Void
+    /// Global Essentials presence (favorites are space-agnostic). Drives the top
+    /// divider so it lines up with the anchored Essentials grid above.
+    let hasEssentials: Bool
+    /// Reports this column's natural content height so the pager can size the
+    /// inner paging scroll to the visible space (the outer scroll does the
+    /// scrolling; the inner pager is laid out at full content height).
+    let onHeight: (CGFloat) -> Void
 
-    /// Only the settled page feeds the drag engine's geometry (Essentials
-    /// render on every page — ungated frames would collide across pages).
+    /// Only the settled page feeds the drag engine's geometry (Essentials render
+    /// once globally; the per-space rows gate on the active page).
     private var isActivePage: Bool {
         spaces.indices.contains(selectedIndex) && spaces[selectedIndex].id == space.id
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: SavantTheme.tierSpacing) {
-                    SpaceHeaderView(
-                        space: space,
-                        spaces: spaces,
-                        selectedIndex: selectedIndex,
-                        selectSpaceAtIndex: selectSpaceAtIndex,
-                        tidyNow: tidyNow
-                    )
-                    .padding(.top, topInset + 8)
+        // PRINCIPLE: lifting a note must not change the layout. Dividers track
+        // real content only (no `|| isActive`) — an empty tier's drop affordance
+        // is revealed by proximity later, not slammed in at drag start.
+        let hasKept = !pinnedFolders.isEmpty || !pinnedNotes.isEmpty
 
-                    if let latestTidyRun, !interaction.isEditing {
-                        TidyBannerView(run: latestTidyRun)
-                            .padding(.top, 2)
-                    }
-
-                    contentSections
-                        .padding(.bottom, 160)
-                }
-                .padding(.horizontal, SavantTheme.pageMargin)
-                // The drag engine's reference frame: row frames are reported
-                // relative to this content space (stable while scrolling);
-                // the live global origin converts finger ↔ content coords.
-                .coordinateSpace(.named("spaceContent"))
-                // `ActiveFrame` re-fires the report when this page becomes
-                // active, not just when the geometry moves — without it only
-                // the launch space ever fed the engine.
-                .onGeometryChange(for: ActiveFrame.self) { proxy in
-                    ActiveFrame(frame: proxy.frame(in: .global), active: isActivePage)
-                } action: { report in
-                    if report.active { dragSession.contentOriginChanged(report.frame.origin) }
-                }
-            }
-            .scrollPosition($scrollPosition)
-            .scrollIndicators(.hidden)
-            // See the pager: a scroll view engaging ANY finger mid-drag
-            // cancels the drag touch. Auto-scroll drives `scrollPosition`
-            // programmatically, which stays allowed.
-            .scrollDisabled(dragSession.isActive)
-            .refreshable { tidyNow() }
-            .onScrollGeometryChange(for: CGFloat.self) { geo in
-                geo.contentOffset.y
-            } action: { _, offsetY in
-                if isActivePage { dragSession.liveScrollOffsetY = offsetY }
-            }
-            .onGeometryChange(for: ActiveFrame.self) { proxy in
-                ActiveFrame(frame: proxy.frame(in: .global), active: isActivePage)
-            } action: { report in
-                // Only SETTLED frames feed the edge bands. A page becomes
-                // active the moment the pager starts animating toward it, so
-                // it reports frames while still sliding in — a stationary
-                // drag finger mid-screen would sit inside the moving frame's
-                // "edge band" and fire a bounce-back switch.
-                if report.active, abs(report.frame.minX) < 1 {
-                    dragSession.viewportGlobal = report.frame
-                }
-            }
-            .onChange(of: randomNotes.map(\.id)) { _, _ in
-                scrollToBottom()
-            }
-
-            AutoScrollDriver(session: dragSession, position: $scrollPosition)
-
-            if interaction.isEditing(spaceID: space.id) {
-                MultiSelectActionBar(space: space, spaces: spaces, allNotes: notes)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .environment(interaction)
-        .environment(\.isActiveSpacePage, isActivePage)
-        .onChange(of: space.id) { _, _ in
-            if interaction.isEditing { interaction.exitEditMode() }
-        }
-        .onDisappear {
-            if dragSession.isActive {
-                print("🧭 DRAG-PROBE page VIEW disappeared mid-drag: \(space.name)")
-            }
-        }
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: interaction.isEditing)
-    }
-
-    /// Figma skeleton: essentials grid / divider / kept rows / divider / stream
-    /// rows. Hairlines appear only between two non-empty sections — except
-    /// mid-drag, when every tier gains presence (empty ones show drop bands)
-    /// so the ghost always has a target.
-    private var contentSections: some View {
-        let dragActive = dragSession.isActive
-        let hasEssentials = !favoriteNotes.isEmpty || dragActive
-        let hasKept = !pinnedFolders.isEmpty || !pinnedNotes.isEmpty || dragActive
-
-        return VStack(alignment: .leading, spacing: SavantTheme.tierSpacing) {
-            FavoritesTileRow(
-                notes: favoriteNotes,
-                allNotes: notes,
-                spaces: spaces,
-                currentSpace: space
-            )
-
+        VStack(alignment: .leading, spacing: SavantTheme.tierSpacing) {
             if hasEssentials && hasKept {
                 tierDivider
             }
@@ -153,6 +66,18 @@ struct SpaceView: View {
                 showsEmptyHint: true
             )
         }
+        .padding(.horizontal, SavantTheme.pageMargin)
+        .padding(.bottom, 160)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .environment(\.isActiveSpacePage, isActivePage)
+        // Natural height (the VStack never stretches vertically) — stable
+        // regardless of the height the inner pager proposes, so reporting it
+        // back doesn't feed a layout loop.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { height in
+            onHeight(height)
+        }
     }
 
     private var tierDivider: some View {
@@ -160,12 +85,6 @@ struct SpaceView: View {
             .fill(SavantTheme.hairline(colorScheme))
             .frame(height: 1)
             .padding(.horizontal, 2)
-    }
-
-    private var favoriteNotes: [Note] {
-        notes
-            .filter { $0.tier == .favorite }
-            .sorted(by: TierRowsBuilder.noteSort)
     }
 
     private var pinnedNotes: [Note] {
@@ -191,20 +110,13 @@ struct SpaceView: View {
             .filter { $0.tier == .random && $0.parent == nil && $0.space?.id == space.id }
             .sorted { $0.sortIndex < $1.sortIndex }
     }
-
-    private func scrollToBottom() {
-        guard !randomNotes.isEmpty else { return }
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) {
-            scrollPosition.scrollTo(edge: .bottom)
-        }
-    }
 }
 
 /// Drives auto-scroll while a drag holds the ghost in the viewport's edge
 /// bands. A zero-size leaf — the only view observing `autoScrollVelocity`,
 /// so band changes never invalidate the page body. The timer ticks on the
 /// `.common` run-loop mode so it keeps firing during touch tracking.
-private struct AutoScrollDriver: View {
+struct AutoScrollDriver: View {
     let session: TouchDragSession
     @Binding var position: ScrollPosition
 

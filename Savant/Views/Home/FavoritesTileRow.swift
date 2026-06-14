@@ -28,8 +28,22 @@ struct FavoritesTileRow: View {
 
         VStack(spacing: 0) {
             if notes.isEmpty {
-                if session.isActive, session.payload?.isNote == true {
-                    TierDropBand(tier: .favorite)
+                // PRINCIPLE: empty Essentials stays collapsed at lift — its slot
+                // grows in only when the ghost actually approaches the top
+                // (proximity reveal), so it never pops above the source rows.
+                // The placeholder is a real grid CELL (card-sized), so the note
+                // settles into it with no further growth on release.
+                if session.revealsEmptyBand(.favorite) {
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        RoundedRectangle(cornerRadius: SavantTheme.cardRadius, style: .continuous)
+                            .fill(.primary.opacity(session.currentTier == .favorite ? 0.06 : 0.02))
+                            .strokeBorder(
+                                .primary.opacity(session.currentTier == .favorite ? 0.28 : 0.12),
+                                style: StrokeStyle(lineWidth: 1.5, dash: [6, 5])
+                            )
+                            .aspectRatio(0.78, contentMode: .fit)
+                    }
+                    .padding(4)
                 }
             } else {
                 LazyVGrid(columns: columns, spacing: 12) {
@@ -52,6 +66,7 @@ struct FavoritesTileRow: View {
         // card, and drops one once an outbound card's hole closes.
         .padding(.bottom, bottomAdjustment)
         .animation(session.isActive ? TouchDragSession.rowShuffle : nil, value: bottomAdjustment)
+        .animation(TouchDragSession.rowShuffle, value: session.revealsEmptyBand(.favorite))
         .onGeometryChange(for: ActiveFrame.self) { proxy in
             ActiveFrame(frame: proxy.frame(in: .named("spaceContent")), active: isActivePage)
         } action: { report in

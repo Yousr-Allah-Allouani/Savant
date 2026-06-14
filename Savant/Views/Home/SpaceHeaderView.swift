@@ -10,6 +10,8 @@ struct SpaceHeaderView: View {
     let selectedIndex: Int
     let selectSpaceAtIndex: (Int) -> Void
     let tidyNow: () -> Void
+    /// Live fractional page index — drives the continuous title transition.
+    let pageOffset: SpacePageOffsetModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -17,32 +19,30 @@ struct SpaceHeaderView: View {
                 .frame(maxWidth: .infinity)
 
             HStack(alignment: .center, spacing: 12) {
-                Button {
-                    appState.presentedSheet = .switcher
-                } label: {
-                    Text(space.name)
-                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                // Full-bleed to the screen edge; the page margin lives as the
+                // title's rest inset, so it clips at the bezel as it slides off.
+                SpaceTitleStrip(
+                    spaces: spaces,
+                    pageOffset: pageOffset,
+                    dimmed: interaction.isEditing,
+                    restInset: SavantTheme.pageMargin,
+                    onTap: { appState.presentedSheet = .switcher }
+                )
+
+                Group {
+                    if interaction.isEditing(spaceID: space.id) {
+                        Button("Done") {
+                            interaction.exitEditMode()
+                        }
+                        .font(.system(.body, design: .rounded).weight(.semibold))
                         .foregroundStyle(.savantInk)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                }
-                .buttonStyle(.plain)
-                .disabled(interaction.isEditing)
-                .opacity(interaction.isEditing ? 0.6 : 1)
-
-                Spacer(minLength: 8)
-
-                if interaction.isEditing(spaceID: space.id) {
-                    Button("Done") {
-                        interaction.exitEditMode()
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("edit-done")
+                    } else {
+                        menuCircle
                     }
-                    .font(.system(.body, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.savantInk)
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("edit-done")
-                } else {
-                    menuCircle
                 }
+                .padding(.trailing, SavantTheme.pageMargin)
             }
         }
     }
@@ -80,6 +80,60 @@ struct SpaceHeaderView: View {
         .tint(.primary)
         .accessibilityLabel("More actions")
         .accessibilityIdentifier("more-actions")
+    }
+}
+
+/// The space title as a continuous, swipe-driven transition (Phase B): the two
+/// nearest spaces' names slide and cross-fade in lockstep with the page offset,
+/// so the title changes at the same rhythm as the color blend and the incoming
+/// rows. Outgoing slides off and fades before it reaches the bezel; a brief
+/// title-less header sits at the crossover; the incoming fades in while sliding
+/// from just right-of-rest into the resting slot. A leaf — only this view reads
+/// `pageOffset`, so the per-swipe-frame work doesn't invalidate the header.
+private struct SpaceTitleStrip: View {
+    let spaces: [Space]
+    let pageOffset: SpacePageOffsetModel
+    let dimmed: Bool
+    /// The title's resting inset from the strip's leading edge. The strip itself
+    /// spans to the SCREEN edge, so the title clips at the real bezel (not at the
+    /// page margin) as it slides off — while still resting at the margin.
+    let restInset: CGFloat
+    let onTap: () -> Void
+
+    /// Horizontal travel per unit page-distance; fade half-width in page units.
+    /// A title is fully gone by ±fadeWidth, so the title-less gap spans
+    /// `2·(0.5 − fadeWidth)` of the swipe — near 0.5 it shrinks to a tiny
+    /// snapshot as the two titles hand off almost exactly at the midpoint.
+    private let travel: CGFloat = 170
+    private let fadeWidth: CGFloat = 0.50
+
+    var body: some View {
+        let offset = pageOffset.value
+        ZStack(alignment: .leading) {
+            ForEach(visibleIndices(offset), id: \.self) { idx in
+                let d = CGFloat(idx) - offset
+                Text(spaces[idx].name)
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.savantInk)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .offset(x: restInset + d * travel)
+                    .opacity(Double(max(0, 1 - abs(d) / fadeWidth)) * (dimmed ? 0.6 : 1))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
+        .contentShape(.rect)
+        .onTapGesture(perform: onTap)
+        .allowsHitTesting(!dimmed)
+    }
+
+    /// Only the spaces within fade range of the current offset need rendering.
+    private func visibleIndices(_ offset: CGFloat) -> [Int] {
+        let lo = max(0, Int((offset - 1).rounded(.down)))
+        let hi = min(spaces.count - 1, Int((offset + 1).rounded(.up)))
+        guard lo <= hi else { return [] }
+        return Array(lo...hi)
     }
 }
 
